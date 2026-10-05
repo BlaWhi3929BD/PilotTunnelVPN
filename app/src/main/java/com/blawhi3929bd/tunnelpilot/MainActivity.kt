@@ -165,20 +165,23 @@ private fun VpnSection(
             Spacer(Modifier.height(16.dp))
 
             Button(
-                Modifier.fillMaxWidth(),
                 onClick = onConnect,
+                modifier = Modifier.fillMaxWidth(),
                 enabled = configPresent && !state.isActive(),
             ) { Text("Connect") }
             Spacer(Modifier.height(8.dp))
             OutlinedButton(
-                Modifier.fillMaxWidth(),
                 onClick = onDisconnect,
+                modifier = Modifier.fillMaxWidth(),
                 enabled = state is VpnState.Connected || state is VpnState.Connecting,
             ) { Text("Disconnect") }
 
             if (reconnectRequired) {
                 Spacer(Modifier.height(8.dp))
-                Button(Modifier.fillMaxWidth(), onClick = onApplyRouting) {
+                Button(
+                    onClick = onApplyRouting,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
                     Text("Reconnect with new routing")
                 }
             }
@@ -315,20 +318,23 @@ private fun ConfigSection(
         )
         Spacer(Modifier.height(12.dp))
         Button(
-            Modifier.fillMaxWidth(),
             onClick = {
                 val result = onSave(text)
                 message = result.fold({ "Configuration saved and validated." }, { it.message ?: "Invalid configuration" })
             },
+            modifier = Modifier.fillMaxWidth(),
             enabled = text.isNotBlank(),
         ) { Text("Save configuration") }
         if (configPresent) {
             Spacer(Modifier.height(8.dp))
-            TextButton(Modifier.fillMaxWidth(), onClick = {
-                onClear()
-                text = ""
-                message = "Saved configuration removed."
-            }) { Text("Delete saved configuration") }
+            TextButton(
+                onClick = {
+                    onClear()
+                    text = ""
+                    message = "Saved configuration removed."
+                },
+                modifier = Modifier.fillMaxWidth(),
+            ) { Text("Delete saved configuration") }
         }
         message?.let {
             Spacer(Modifier.height(8.dp))

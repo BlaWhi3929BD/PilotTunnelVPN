@@ -103,10 +103,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             _provisioningState.value = ProvisioningState.Provisioning
             runCatching {
-                val privateKey = identityStore.loadPrivateKey() ?: TunnelPilotKeyGenerator
-                    .generatePrivateKey()
-                    .also { identityStore.savePrivateKey(it.toBase64()) }
-                    .toBase64()
+                val privateKey = identityStore.loadPrivateKey() ?: run {
+                    val generated = TunnelPilotKeyGenerator.generatePrivateKey().toBase64()
+                    identityStore.savePrivateKey(generated)
+                    generated
+                }
                 val privateKeyObject = com.wireguard.crypto.Key.fromBase64(privateKey)
                 val publicKey = TunnelPilotKeyGenerator.generatePublicKey(privateKeyObject).toBase64()
                 val deviceId = identityStore.getOrCreateDeviceId()

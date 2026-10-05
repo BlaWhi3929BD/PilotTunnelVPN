@@ -78,6 +78,7 @@ class SecureIdentityStore(context: Context) {
     }
 
     private companion object {
+        const val ANDROID_KEYSTORE = "AndroidKeyStore"
         const val NAME = "tunnelpilot_identity"
         const val ALIAS = "tunnelpilot_identity_key"
         const val TRANSFORMATION = "AES/GCM/NoPadding"
