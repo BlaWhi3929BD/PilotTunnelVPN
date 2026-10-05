@@ -1,21 +1,20 @@
-# TunnelPilot lint-zero fix
+# TunnelPilot — final lint fix
 
-Base remote commit: 4f1cd2395e3daf9ae4b1efb0fa9d0fee1fbd4968.
+Based on GitHub HEAD `8c727ab2946c4642b9bc4fe662bb397535debdde`.
 
-This fixes the 12 lint errors from the latest report:
-- kotlinx-coroutines-android 1.10.2 -> 1.11.0
-- desugar_jdk_libs 2.0.3 -> 2.1.5
-- add androidx.core:core-ktx 1.19.1 for the KTX SharedPreferences extensions
-- add Android 12+ data extraction rules while keeping backups disabled
-- add an explicit application icon
-- convert SharedPreferences.edit() calls to the KTX edit extension
+The current remote manifest contains `android:dataExtractionRules` but is missing the required `android:fullBackupContent` for `minSdk = 24`, and `backup_rules.xml` does not yet exist.
 
-Because your working tree currently shows a modified file, use the ZIP as a file replacement rather than cherry-picking.
+Copy the two files from this archive into the repository root, replacing:
 
-From the repository root:
-  unzip -o /path/to/PilotTunnelVPN_lint_zero_fix.zip -d .
+- `app/src/main/AndroidManifest.xml`
+- adding `app/src/main/res/xml/backup_rules.xml`
 
-Then:
-  ./gradlew :app:testDebugUnitTest
-  ./gradlew :app:assembleDebug
-  ./gradlew :app:lintDebug
+Then run:
+
+```fish
+./gradlew :app:testDebugUnitTest
+./gradlew :app:assembleDebug
+./gradlew :app:lintDebug
+```
+
+Expected result: `:app:lintDebug` succeeds with 0 errors.
