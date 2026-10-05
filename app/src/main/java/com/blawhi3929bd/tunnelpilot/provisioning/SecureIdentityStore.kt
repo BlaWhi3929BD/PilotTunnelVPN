@@ -4,6 +4,7 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
+import androidx.core.content.edit
 import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import java.util.UUID
@@ -19,7 +20,7 @@ class SecureIdentityStore(context: Context) {
     fun getOrCreateDeviceId(): String {
         prefs.getString(KEY_DEVICE_ID, null)?.let { return it }
         val deviceId = UUID.randomUUID().toString()
-        prefs.edit().putString(KEY_DEVICE_ID, deviceId).apply()
+        prefs.edit { putString(KEY_DEVICE_ID, deviceId) }
         return deviceId
     }
 
@@ -45,17 +46,17 @@ class SecureIdentityStore(context: Context) {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, key())
         val ciphertext = cipher.doFinal(privateKey.toByteArray(StandardCharsets.UTF_8))
-        prefs.edit()
-            .putString(KEY_CIPHERTEXT, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
-            .putString(KEY_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
-            .apply()
+        prefs.edit {
+            putString(KEY_CIPHERTEXT, Base64.encodeToString(ciphertext, Base64.NO_WRAP))
+            putString(KEY_IV, Base64.encodeToString(cipher.iv, Base64.NO_WRAP))
+        }
     }
 
     fun clearPrivateKey() {
-        prefs.edit()
-            .remove(KEY_CIPHERTEXT)
-            .remove(KEY_IV)
-            .apply()
+        prefs.edit {
+            remove(KEY_CIPHERTEXT)
+            remove(KEY_IV)
+        }
     }
 
     private fun key(): SecretKey {

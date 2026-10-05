@@ -1,6 +1,7 @@
 package com.blawhi3929bd.tunnelpilot.data
 
 import android.content.Context
+import androidx.core.content.edit
 import com.blawhi3929bd.tunnelpilot.RoutingMode
 
 class AppSettingsStore(context: Context) {
@@ -12,19 +13,20 @@ class AppSettingsStore(context: Context) {
     }
 
     fun setRoutingMode(mode: RoutingMode) {
-        prefs.edit().putString(KEY_ROUTING_MODE, mode.name).apply()
+        prefs.edit { putString(KEY_ROUTING_MODE, mode.name) }
     }
 
     fun getSelectedApps(): Set<String> = prefs.getStringSet(KEY_SELECTED_APPS, emptySet()).orEmpty()
 
     fun setSelectedApps(packages: Set<String>) {
-        prefs.edit().putStringSet(KEY_SELECTED_APPS, packages.toSet()).apply()
+        prefs.edit { putStringSet(KEY_SELECTED_APPS, packages.toSet()) }
     }
 
-    fun getControlPlaneUrl(): String = prefs.getString(KEY_CONTROL_PLANE_URL, DEFAULT_CONTROL_PLANE_URL).orEmpty()
+    fun getControlPlaneUrl(): String =
+        prefs.getString(KEY_CONTROL_PLANE_URL, DEFAULT_CONTROL_PLANE_URL).orEmpty()
 
     fun setControlPlaneUrl(url: String) {
-        prefs.edit().putString(KEY_CONTROL_PLANE_URL, url.trim()).apply()
+        prefs.edit { putString(KEY_CONTROL_PLANE_URL, url.trim()) }
     }
 
     private companion object {
