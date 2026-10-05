@@ -2,16 +2,23 @@ from __future__ import annotations
 
 import base64
 import binascii
+import ipaddress
 import os
+from urllib.parse import quote
 from datetime import datetime, timezone
 from typing import Annotated
 
+import httpx
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title="TunnelPilot Control Plane", version="0.2.0")
+app = FastAPI(title="TunnelPilot Control Plane", version="0.3.0")
 
 CONTROL_PLANE_TOKEN = os.getenv("TUNNELPILOT_CONTROL_PLANE_TOKEN")
+GATEWAY_AGENT_URL = os.getenv("TUNNELPILOT_GATEWAY_AGENT_URL")
+GATEWAY_AGENT_TOKEN = os.getenv("TUNNELPILOT_GATEWAY_AGENT_TOKEN")
+VPN_ADDRESS_POOL = os.getenv("TUNNELPILOT_VPN_ADDRESS_POOL", "10.67.0.0/24")
+VPN_GATEWAY_ADDRESS = os.getenv("TUNNELPILOT_VPN_GATEWAY_ADDRESS", "10.67.0.1")
 
 
 class Server(BaseModel):
@@ -21,6 +28,7 @@ class Server(BaseModel):
     public_key: str
     port: int = Field(default=51820, ge=1, le=65535)
     enabled: bool = True
+    gateway_api_url: str | None = Field(default=None, exclude=True)
 
 
 class DeviceRegistration(BaseModel):
@@ -45,15 +53,24 @@ class DeviceRecord(BaseModel):
     client_public_key: str
     app_version: str
     server_id: str
+    client_address: str
     created_at: datetime
     last_seen_at: datetime
+    provisioned: bool = False
 
 
 class DeviceRegistrationResponse(BaseModel):
     status: str
     device_id: str
     server: Server
+    client_address: str
+    provisioned: bool
     registered_at: datetime
+
+
+class DeviceRevocationResponse(BaseModel):
+    status: str
+    device_id: str
 
 
 SERVERS = [
@@ -62,6 +79,7 @@ SERVERS = [
         region="dev",
         hostname="replace-with-real-gateway",
         public_key="replace-with-gateway-public-key",
+        gateway_api_url=GATEWAY_AGENT_URL,
     )
 ]
 
@@ -76,6 +94,86 @@ def _utc_now() -> datetime:
 def _require_control_plane_auth(authorization: str | None) -> None:
     if CONTROL_PLANE_TOKEN is not None and authorization != f"Bearer {CONTROL_PLANE_TOKEN}":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+
+def _address_pool() -> ipaddress.IPv4Network:
+    try:
+        network = ipaddress.ip_network(VPN_ADDRESS_POOL, strict=True)
+    except ValueError as exc:
+        raise RuntimeError("TUNNELPILOT_VPN_ADDRESS_POOL must be a valid CIDR network") from exc
+    if network.version != 4 or network.prefixlen >= 31:
+        raise RuntimeError("TUNNELPILOT_VPN_ADDRESS_POOL must be an IPv4 network of at least /30")
+    return network
+
+
+def _allocate_client_address() -> str:
+    network = _address_pool()
+    used = {record.client_address.split("/", 1)[0] for record in DEVICES.values()}
+    try:
+        gateway_address = ipaddress.ip_address(VPN_GATEWAY_ADDRESS)
+    except ValueError as exc:
+        raise RuntimeError("TUNNELPILOT_VPN_GATEWAY_ADDRESS must be a valid IPv4 address") from exc
+    if gateway_address.version != 4 or gateway_address not in network:
+        raise RuntimeError("TUNNELPILOT_VPN_GATEWAY_ADDRESS must be inside TUNNELPILOT_VPN_ADDRESS_POOL")
+
+    for host in network.hosts():
+        value = str(host)
+        if host == gateway_address:
+            continue
+        if value not in used:
+            return f"{value}/32"
+    raise HTTPException(status_code=503, detail="No VPN client addresses are currently available")
+
+
+def _gateway_url(server: Server) -> str | None:
+    return server.gateway_api_url or GATEWAY_AGENT_URL
+
+
+def _gateway_headers() -> dict[str, str]:
+    if not GATEWAY_AGENT_TOKEN:
+        raise HTTPException(status_code=503, detail="Gateway agent token is not configured")
+    return {"Authorization": f"Bearer {GATEWAY_AGENT_TOKEN}"}
+
+
+def _gateway_request(
+    method: str,
+    path: str,
+    *,
+    server: Server,
+    json: dict[str, str] | None = None,
+) -> httpx.Response:
+    base_url = _gateway_url(server)
+    if not base_url:
+        raise HTTPException(status_code=503, detail="Gateway agent URL is not configured")
+
+    try:
+        with httpx.Client(base_url=base_url.rstrip("/"), timeout=5.0) as client:
+            return client.request(method, path, headers=_gateway_headers(), json=json)
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail="Gateway agent is unreachable") from exc
+
+
+def _provision_peer(server: Server, public_key: str, client_address: str) -> None:
+    response = _gateway_request(
+        "POST",
+        "/v1/peers",
+        server=server,
+        json={"public_key": public_key, "allowed_ip": client_address},
+    )
+    if response.status_code >= 300:
+        detail = response.text[:300] or "Gateway agent rejected peer provisioning"
+        raise HTTPException(status_code=502, detail=detail)
+
+
+def _revoke_peer(server: Server, public_key: str) -> None:
+    response = _gateway_request(
+        "DELETE",
+        f"/v1/peers?public_key={quote(public_key, safe='')}",
+        server=server,
+    )
+    if response.status_code >= 300:
+        detail = response.text[:300] or "Gateway agent rejected peer revocation"
+        raise HTTPException(status_code=502, detail=detail)
 
 
 @app.get("/healthz")
@@ -99,7 +197,6 @@ def register_device(
     if server is None:
         raise HTTPException(status_code=503, detail="No VPN server is currently available")
 
-    now = _utc_now()
     existing = DEVICES.get(registration.device_id)
     if existing is not None and existing.client_public_key != registration.client_public_key:
         raise HTTPException(
@@ -107,19 +204,68 @@ def register_device(
             detail="device_id is already registered with a different public key",
         )
 
+    same_key = next(
+        (
+            item
+            for item in DEVICES.values()
+            if item.client_public_key == registration.client_public_key
+            and item.device_id != registration.device_id
+        ),
+        None,
+    )
+    if same_key is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="client_public_key is already registered to another device_id",
+        )
+
+    now = _utc_now()
+    client_address = existing.client_address if existing is not None else _allocate_client_address()
+    provisioned = existing.provisioned if existing is not None else False
+
+    if not provisioned and _gateway_url(server):
+        _provision_peer(server, registration.client_public_key, client_address)
+        provisioned = True
+
     created_at = existing.created_at if existing is not None else now
     DEVICES[registration.device_id] = DeviceRecord(
         device_id=registration.device_id,
         client_public_key=registration.client_public_key,
         app_version=registration.app_version,
         server_id=server.id,
+        client_address=client_address,
         created_at=created_at,
         last_seen_at=now,
+        provisioned=provisioned,
     )
 
     return DeviceRegistrationResponse(
         status="accepted",
         device_id=registration.device_id,
         server=server,
+        client_address=client_address,
+        provisioned=provisioned,
         registered_at=created_at,
     )
+
+
+@app.delete("/v1/devices/{device_id}", response_model=DeviceRevocationResponse)
+def revoke_device(
+    device_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> DeviceRevocationResponse:
+    _require_control_plane_auth(authorization)
+
+    record = DEVICES.get(device_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    server = next((item for item in SERVERS if item.id == record.server_id), None)
+    if server is None:
+        raise HTTPException(status_code=503, detail="Assigned VPN server is unavailable")
+
+    if record.provisioned and _gateway_url(server):
+        _revoke_peer(server, record.client_public_key)
+
+    del DEVICES[device_id]
+    return DeviceRevocationResponse(status="revoked", device_id=device_id)
