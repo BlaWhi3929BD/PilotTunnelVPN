@@ -156,20 +156,20 @@ private fun VpnSection(
             Spacer(Modifier.height(16.dp))
 
             Button(
-                Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth(),
                 onClick = onConnect,
                 enabled = configPresent && !state.isActive(),
             ) { Text("Connect") }
             Spacer(Modifier.height(8.dp))
             OutlinedButton(
-                Modifier.fillMaxWidth(),
+                modifier = Modifier.fillMaxWidth(),
                 onClick = onDisconnect,
                 enabled = state is VpnState.Connected || state is VpnState.Connecting,
             ) { Text("Disconnect") }
 
             if (reconnectRequired) {
                 Spacer(Modifier.height(8.dp))
-                Button(Modifier.fillMaxWidth(), onClick = onApplyRouting) {
+                Button(modifier = Modifier.fillMaxWidth(), onClick = onApplyRouting) {
                     Text("Reconnect with new routing")
                 }
             }
@@ -248,7 +248,7 @@ private fun ConfigSection(
         OutlinedTextField(
             value = text,
             onValueChange = { text = it },
-            Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth(),
             minLines = 12,
             label = { Text("[Interface] / [Peer]") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
@@ -256,7 +256,7 @@ private fun ConfigSection(
         )
         Spacer(Modifier.height(12.dp))
         Button(
-            Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth(),
             onClick = {
                 val result = onSave(text)
                 message = result.fold({ "Configuration saved and validated." }, { it.message ?: "Invalid configuration" })
@@ -265,7 +265,7 @@ private fun ConfigSection(
         ) { Text("Save configuration") }
         if (configPresent) {
             Spacer(Modifier.height(8.dp))
-            TextButton(Modifier.fillMaxWidth(), onClick = {
+            TextButton(modifier = Modifier.fillMaxWidth(), onClick = {
                 onClear()
                 text = ""
                 message = "Saved configuration removed."
