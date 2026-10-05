@@ -8,10 +8,10 @@ import java.nio.charset.StandardCharsets
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
+import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
-import javax.crypto.spec.SecretKeySpec
 
-/** Stores a WireGuard config encrypted with an Android Keystore AES key. */
+/** Stores a WireGuard client configuration encrypted by an Android Keystore AES key. */
 class SecureConfigStore(context: Context) {
     private val prefs = context.getSharedPreferences("vpn_secure_config", Context.MODE_PRIVATE)
 
@@ -28,23 +28,28 @@ class SecureConfigStore(context: Context) {
     fun load(): String? {
         val ciphertext = prefs.getString(KEY_CIPHERTEXT, null) ?: return null
         val iv = prefs.getString(KEY_IV, null) ?: return null
-        val cipher = Cipher.getInstance(TRANSFORMATION)
-        cipher.init(
-            Cipher.DECRYPT_MODE,
-            key(),
-            GCMParameterSpec(128, Base64.decode(iv, Base64.NO_WRAP)),
-        )
-        val plaintext = cipher.doFinal(Base64.decode(ciphertext, Base64.NO_WRAP))
-        return plaintext.toString(StandardCharsets.UTF_8)
+        return runCatching {
+            val cipher = Cipher.getInstance(TRANSFORMATION)
+            cipher.init(
+                Cipher.DECRYPT_MODE,
+                key(),
+                GCMParameterSpec(128, Base64.decode(iv, Base64.NO_WRAP)),
+            )
+            cipher.doFinal(Base64.decode(ciphertext, Base64.NO_WRAP))
+                .toString(StandardCharsets.UTF_8)
+        }.getOrElse {
+            clear()
+            null
+        }
     }
 
     fun clear() {
         prefs.edit().clear().apply()
     }
 
-    private fun key(): SecretKeySpec {
-        val ks = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
-        if (!ks.containsAlias(ALIAS)) {
+    private fun key(): SecretKey {
+        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        if (!keyStore.containsAlias(ALIAS)) {
             val generator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
             generator.init(
                 KeyGenParameterSpec.Builder(
@@ -58,8 +63,7 @@ class SecureConfigStore(context: Context) {
             )
             generator.generateKey()
         }
-        val entry = ks.getEntry(ALIAS, null) as KeyStore.SecretKeyEntry
-        return SecretKeySpec(entry.secretKey.encoded, KeyProperties.KEY_ALGORITHM_AES)
+        return (keyStore.getEntry(ALIAS, null) as KeyStore.SecretKeyEntry).secretKey
     }
 
     private companion object {

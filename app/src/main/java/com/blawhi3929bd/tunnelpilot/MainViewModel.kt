@@ -5,20 +5,26 @@ import android.content.Intent
 import android.net.VpnService
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.blawhi3929bd.tunnelpilot.data.AppSettingsStore
 import com.blawhi3929bd.tunnelpilot.data.InstalledApp
 import com.blawhi3929bd.tunnelpilot.data.InstalledAppsRepository
 import com.blawhi3929bd.tunnelpilot.data.SecureConfigStore
 import com.wireguard.android.backend.BackendException
+import com.wireguard.config.Config
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.io.ByteArrayInputStream
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val appContext = application.applicationContext
     private val manager = WireGuardManager(appContext)
     private val configStore = SecureConfigStore(appContext)
+    private val settingsStore = AppSettingsStore(appContext)
     private val installedAppsRepository = InstalledAppsRepository(appContext)
 
     private val _state = MutableStateFlow<VpnState>(VpnState.Disconnected)
@@ -30,8 +36,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _installedApps = MutableStateFlow<List<InstalledApp>>(emptyList())
     val installedApps: StateFlow<List<InstalledApp>> = _installedApps.asStateFlow()
 
-    private val _selectedApps = MutableStateFlow<Set<String>>(emptySet())
+    private val _selectedApps = MutableStateFlow(settingsStore.getSelectedApps())
     val selectedApps: StateFlow<Set<String>> = _selectedApps.asStateFlow()
+
+    private val _routingMode = MutableStateFlow(settingsStore.getRoutingMode())
+    val routingMode: StateFlow<RoutingMode> = _routingMode.asStateFlow()
+
+    private val _reconnectRequired = MutableStateFlow(false)
+    val reconnectRequired: StateFlow<Boolean> = _reconnectRequired.asStateFlow()
+
+    private var statsJob: Job? = null
 
     init {
         refreshInstalledApps()
@@ -45,25 +59,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setConfig(rawConfig: String): Result<Unit> = runCatching {
-        require(rawConfig.contains("[Interface]", ignoreCase = true)) {
-            "WireGuard config must contain an [Interface] section"
-        }
-        require(rawConfig.contains("PrivateKey", ignoreCase = true)) {
-            "WireGuard config must contain an interface PrivateKey"
-        }
-        require(rawConfig.contains("[Peer]", ignoreCase = true)) {
-            "WireGuard config must contain at least one [Peer]"
-        }
-        configStore.save(rawConfig)
-        _configPresent.value = true
-    }
-
-    fun clearConfig() {
-        configStore.clear()
-        _configPresent.value = false
-        _selectedApps.value = emptySet()
-        _state.value = VpnState.Disconnected
+    fun setRoutingMode(mode: RoutingMode) {
+        _routingMode.value = mode
+        settingsStore.setRoutingMode(mode)
+        markRoutingChanged()
     }
 
     fun toggleApp(packageName: String) {
@@ -71,46 +70,117 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             addAll(_selectedApps.value)
             if (!add(packageName)) remove(packageName)
         }
+        settingsStore.setSelectedApps(_selectedApps.value)
+        markRoutingChanged()
+    }
+
+    fun setConfig(rawConfig: String): Result<Unit> = runCatching {
+        require(rawConfig.contains("[Interface]", ignoreCase = true)) {
+            "Config must contain an [Interface] section"
+        }
+        require(rawConfig.contains("[Peer]", ignoreCase = true)) {
+            "Config must contain at least one [Peer] section"
+        }
+        Config.parse(ByteArrayInputStream(rawConfig.toByteArray(Charsets.UTF_8)))
+        configStore.save(rawConfig.trim() + "\n")
+        _configPresent.value = true
+    }
+
+    fun clearConfig() {
+        disconnect()
+        configStore.clear()
+        _configPresent.value = false
+        _reconnectRequired.value = false
     }
 
     fun connect() {
         if (!_configPresent.value) {
-            _state.value = VpnState.Error("Import a WireGuard config first")
+            setError("Import a WireGuard configuration first")
+            return
+        }
+        if (_routingMode.value == RoutingMode.SELECTED_APPS && _selectedApps.value.isEmpty()) {
+            setError("Select at least one app for Selected apps mode")
             return
         }
         if (requiredVpnPermissionIntent() != null) {
-            _state.value = VpnState.Error("VPN permission is required")
-            return
-        }
-
-        val rawConfig = configStore.load()
-        if (rawConfig == null) {
-            _state.value = VpnState.Error("Saved VPN config is unavailable")
+            setError("Android VPN permission is required")
             return
         }
 
         viewModelScope.launch(Dispatchers.IO) {
-            _state.value = VpnState.Connecting
-            try {
-                val config = ConfigEditor.withIncludedApplications(rawConfig, _selectedApps.value)
-                manager.connect(config)
-                _state.value = VpnState.Connected
-            } catch (e: BackendException) {
-                _state.value = VpnState.Error(e.message ?: "WireGuard backend error")
-            } catch (e: Exception) {
-                _state.value = VpnState.Error(e.message ?: "Unable to connect")
-            }
+            performConnect()
         }
     }
 
     fun disconnect() {
+        statsJob?.cancel()
+        statsJob = null
         viewModelScope.launch(Dispatchers.IO) {
-            try {
-                manager.disconnect()
-                _state.value = VpnState.Disconnected
-            } catch (e: Exception) {
-                _state.value = VpnState.Error(e.message ?: "Unable to disconnect")
+            runCatching { manager.disconnect() }
+                .onSuccess { _state.value = VpnState.Disconnected }
+                .onFailure { setError(it.message ?: "Unable to disconnect") }
+        }
+    }
+
+    fun applyRoutingChanges() {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching { manager.disconnect() }
+            performConnect()
+        }
+    }
+
+    private suspend fun performConnect() {
+        val rawConfig = configStore.load()
+        if (rawConfig == null) {
+            setError("The saved configuration could not be decrypted")
+            return
+        }
+
+        _state.value = VpnState.Connecting
+        try {
+            val installed = _installedApps.value.asSequence().map { it.packageName }.toSet()
+            val selected = _selectedApps.value.intersect(installed)
+            val config = if (_routingMode.value == RoutingMode.SELECTED_APPS) {
+                ConfigEditor.withIncludedApplications(rawConfig, selected)
+            } else {
+                ConfigEditor.withIncludedApplications(rawConfig, emptySet())
+            }
+            manager.connect(config)
+            _reconnectRequired.value = false
+            updateStats()
+            startStatsPolling()
+        } catch (e: BackendException) {
+            setError(e.message ?: "WireGuard backend error")
+        } catch (e: Exception) {
+            setError(e.message ?: "Unable to connect")
+        }
+    }
+
+    private fun startStatsPolling() {
+        statsJob?.cancel()
+        statsJob = viewModelScope.launch(Dispatchers.IO) {
+            while (_state.value is VpnState.Connected) {
+                delay(1000)
+                updateStats()
             }
         }
+    }
+
+    private fun updateStats() {
+        val stats = manager.statistics() ?: return
+        _state.value = VpnState.Connected(
+            rxBytes = stats.totalRx(),
+            txBytes = stats.totalTx(),
+        )
+    }
+
+    private fun markRoutingChanged() {
+        if (_state.value is VpnState.Connected) _reconnectRequired.value = true
+    }
+
+    private fun setError(message: String) {
+        statsJob?.cancel()
+        statsJob = null
+        _state.value = VpnState.Error(message)
     }
 }

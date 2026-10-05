@@ -1,40 +1,54 @@
 # TunnelPilot
 
-Android-first free VPN project.
+TunnelPilot is an Android-first free WireGuard VPN client. The product goal is a simple VPN that can be free with in-app advertising, while keeping VPN traffic handling separate from advertising and analytics.
 
-> Codename and package name are provisional. The final product name, legal entity, domain, and store listing will be decided before publication.
+## What is implemented
 
-## Current status
+- Native Android VPN flow using WireGuard Android Tunnel Library.
+- Encrypted local storage for the client configuration with Android Keystore.
+- Full-device routing mode.
+- Per-app routing mode using WireGuard's Android `IncludedApplications` support.
+- Searchable installed-app selector.
+- Live RX/TX counters while connected.
+- Configuration validation before storage.
+- Explicit reconnect flow when routing rules change.
+- CI/build and unit-test foundation.
 
-**Milestone 0 — project bootstrap (local implementation complete)**
+## Important product decision
 
-- Kotlin + Android Gradle Plugin 9.1.1
-- Java 17
-- Jetpack Compose
-- WireGuard Android Tunnel Library 1.0.23
-- VPN permission request flow
-- real WireGuard connect/disconnect using an imported client configuration
-- per-app tunnel allow-list for the current VPN session
-- automatic connect-on-app-launch is intentionally not implemented yet
-- Initial unit test
-- Security/architecture notes
-
-## Build
-
-Open this directory in current Android Studio and let it provision the matching Gradle distribution. The project is configured for AGP 9.1.1 / Gradle 9.3.1.
-
-A real server configuration is deliberately not included. Never commit WireGuard private keys, tokens, or production server credentials.
+"Selected apps" mode means the VPN tunnel stays active while only the selected applications are allowed through the VPN. Android's public VPN API supports an allow-list that is fixed when the VPN connection is established; changing it requires establishing a new VPN connection. This is more reliable and more policy-friendly than trying to monitor which app is foregrounded and repeatedly starting/stopping the VPN.
 
 ## Roadmap
 
-1. Control plane API + database
-2. First WireGuard gateway
-3. Device registration + short-lived client config issuance
-4. Real connect/disconnect
-5. Server selection and health scoring
-6. Per-app VPN / Auto-VPN
-7. In-app advertising without traffic monetization tricks
-8. Privacy and consent flows
-9. Security audit
-10. Closed beta
-11. Google Play publication
+### M2 — gateway + control plane
+- one production-like WireGuard gateway
+- server health endpoint
+- device registration using a locally generated client public key
+- short-lived client configuration issuance
+- peer rotation/revocation
+- server catalog and health scoring
+
+### M3 — product polish
+- onboarding
+- connection diagnostics
+- DNS/route validation
+- crash reporting and privacy-safe analytics
+- quick settings / reconnect affordance
+- transparent privacy disclosures
+
+### M4 — monetization
+- in-app ads only
+- explicit consent flow where required
+- optional rewarded ads using an opt-in reward model
+- optional premium tier
+
+### M5 — release
+- security audit
+- VPN declaration and store listing disclosure
+- privacy policy / data safety documentation
+- closed beta
+- production rollout
+
+## Security rules
+
+Never commit WireGuard private keys, server private keys, API tokens, signing keys, ad credentials, or production database secrets.

@@ -4,7 +4,10 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 
-class InstalledAppsRepository(context: Context) {
+class InstalledAppsRepository(
+    context: Context,
+    private val ownPackageName: String = context.packageName,
+) {
     private val packageManager = context.packageManager
 
     fun getLaunchableApps(): List<InstalledApp> {
@@ -18,6 +21,7 @@ class InstalledAppsRepository(context: Context) {
                     label = info.loadLabel(packageManager).toString(),
                 )
             }
+            .filterNot { it.packageName == ownPackageName }
             .distinctBy { it.packageName }
             .sortedBy { it.label.lowercase() }
             .toList()

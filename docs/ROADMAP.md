@@ -1,45 +1,48 @@
 # Roadmap
 
-## M0 — bootstrap (done)
-- Android project with modern AGP 9.1 / built-in Kotlin
-- Compose UI
-- WireGuard Tunnel Library integration
-- VPN permission handling
-- local encrypted client-config storage
-- application allow-list editing (manual VPN session routing)
+## M0 — bootstrap ✅
+- Android project
+- modern AGP/Kotlin/Compose
+- WireGuard tunnel integration
+- VPN permission
+- encrypted config storage
+- per-app routing MVP
+- tests and CI foundation
 
-## M1 — real single-server VPN
-- provision one WireGuard gateway
-- establish a real test client configuration
-- verify tunnel + DNS + reconnect
-- add connection diagnostics
+## M1 — local production-quality MVP ✅
+- polished VPN/app/config screens
+- routing modes
+- searchable app selection
+- routing-change reconnect flow
+- RX/TX diagnostics
+- stronger config validation
+- safer Keystore usage
 
-## M2 — control plane
-- API service
-- device registration
+## M2 — real gateway
+- deploy one WireGuard gateway
+- verify DNS/IPv4/IPv6 behavior
+- verify reconnect and sleep/wake
+- verify per-app routing on a physical device
+- gateway health endpoint
+
+## M3 — control plane
+- device registration by public key
+- peer provisioning
+- configuration rotation/revocation
 - server catalog
-- short-lived config issuance
-- gateway health and capacity
-- rate limiting and audit-safe logs
+- capacity/health scoring
 
-## M3 — Auto-VPN
-- selected app allow-list
-- automatic connect on selected app launch
-- disconnect grace period
-- background lifecycle handling
-
-## M4 — product
-- onboarding
-- privacy/disclosure
-- analytics that exclude traffic contents
-- in-app advertising
-- premium option
-- server ranking
+## M4 — monetization
+- privacy/consent UX
+- in-app ads
+- optional rewarded ads
+- optional premium
 
 ## M5 — release
-- security scan
+- security review
 - abuse/risk review
-- privacy policy
 - Play VpnService declaration
-- internal / closed testing
+- privacy policy
+- Data safety disclosure
+- internal and closed testing
 - production rollout

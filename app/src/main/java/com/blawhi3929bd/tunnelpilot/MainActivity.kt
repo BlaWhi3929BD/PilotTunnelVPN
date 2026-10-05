@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
@@ -26,6 +27,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -33,16 +35,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.text.input.KeyboardOptions
-import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     private val viewModel by viewModels<MainViewModel>()
 
     private val vpnPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
+        ActivityResultContracts.StartActivityForResult(),
     ) {
         if (it.resultCode == RESULT_OK) viewModel.connect()
     }
@@ -51,13 +53,12 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             MaterialTheme {
-                Surface(modifier = Modifier.fillMaxSize()) {
+                Surface(Modifier.fillMaxSize()) {
                     TunnelPilotScreen(
                         viewModel = viewModel,
                         requestVpnPermission = {
-                            val intent: Intent? = viewModel.requiredVpnPermissionIntent()
-                            if (intent != null) vpnPermissionLauncher.launch(intent)
-                            else viewModel.connect()
+                            val intent = viewModel.requiredVpnPermissionIntent()
+                            if (intent != null) vpnPermissionLauncher.launch(intent) else viewModel.connect()
                         },
                     )
                 }
@@ -66,7 +67,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-@androidx.compose.runtime.Composable
+@Composable
 private fun TunnelPilotScreen(
     viewModel: MainViewModel,
     requestVpnPermission: () -> Unit,
@@ -76,97 +77,158 @@ private fun TunnelPilotScreen(
     val configPresent by viewModel.configPresent.collectAsState()
     val apps by viewModel.installedApps.collectAsState()
     val selectedApps by viewModel.selectedApps.collectAsState()
+    val routingMode by viewModel.routingMode.collectAsState()
+    val reconnectRequired by viewModel.reconnectRequired.collectAsState()
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(20.dp),
-    ) {
+    Column(Modifier.fillMaxSize().padding(20.dp)) {
         Text("TunnelPilot", style = MaterialTheme.typography.headlineMedium)
-        Text("Free WireGuard VPN · MVP", style = MaterialTheme.typography.bodyMedium)
+        Text("Free WireGuard VPN", style = MaterialTheme.typography.bodyMedium)
         Spacer(Modifier.height(16.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             listOf("VPN", "Apps", "Config").forEach { item ->
-                if (section == item) {
-                    Button(onClick = { section = item }) { Text(item) }
-                } else {
-                    OutlinedButton(onClick = { section = item }) { Text(item) }
-                }
+                if (section == item) Button(onClick = { section = item }) { Text(item) }
+                else OutlinedButton(onClick = { section = item }) { Text(item) }
             }
         }
         Spacer(Modifier.height(16.dp))
 
         when (section) {
-            "VPN" -> {
-                Card(modifier = Modifier.fillMaxWidth()) {
-                    Column(modifier = Modifier.padding(18.dp)) {
-                        Text(stateLabel(state), style = MaterialTheme.typography.titleLarge)
-                        Spacer(Modifier.height(8.dp))
-                        Text(
-                            if (selectedApps.isEmpty()) {
-                                "All applications use the tunnel."
-                            } else {
-                                "VPN allow-list: ${selectedApps.size} app(s)"
-                            },
-                        )
-                        Spacer(Modifier.height(16.dp))
-                        Button(
-                            modifier = Modifier.fillMaxWidth(),
-                            onClick = requestVpnPermission,
-                            enabled = configPresent && state !is VpnState.Connecting && state !is VpnState.Connected,
-                        ) { Text("Connect") }
-                        Spacer(Modifier.height(8.dp))
-                        OutlinedButton(
-                            modifier = Modifier.fillMaxWidth(),
-                            onClick = viewModel::disconnect,
-                            enabled = state is VpnState.Connected,
-                        ) { Text("Disconnect") }
-                        if (state is VpnState.Error) {
-                            Spacer(Modifier.height(8.dp))
-                            Text(
-                                text = (state as VpnState.Error).message,
-                                color = MaterialTheme.colorScheme.error,
-                            )
-                        }
-                    }
+            "VPN" -> VpnSection(
+                state = state,
+                configPresent = configPresent,
+                routingMode = routingMode,
+                selectedCount = selectedApps.size,
+                reconnectRequired = reconnectRequired,
+                onConnect = requestVpnPermission,
+                onDisconnect = viewModel::disconnect,
+                onApplyRouting = viewModel::applyRoutingChanges,
+                onRoutingMode = viewModel::setRoutingMode,
+            )
+            "Apps" -> AppsSection(
+                apps = apps,
+                selectedApps = selectedApps,
+                onToggle = viewModel::toggleApp,
+                onRefresh = viewModel::refreshInstalledApps,
+            )
+            "Config" -> ConfigSection(
+                configPresent = configPresent,
+                onSave = viewModel::setConfig,
+                onClear = viewModel::clearConfig,
+            )
+        }
+    }
+}
+
+@Composable
+private fun VpnSection(
+    state: VpnState,
+    configPresent: Boolean,
+    routingMode: RoutingMode,
+    selectedCount: Int,
+    reconnectRequired: Boolean,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    onApplyRouting: () -> Unit,
+    onRoutingMode: (RoutingMode) -> Unit,
+) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(18.dp)) {
+            Text(stateLabel(state), style = MaterialTheme.typography.titleLarge)
+            Spacer(Modifier.height(6.dp))
+            Text(routingDescription(routingMode, selectedCount))
+            Spacer(Modifier.height(16.dp))
+
+            Text("Routing mode", style = MaterialTheme.typography.titleMedium)
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (routingMode == RoutingMode.ALL_APPS) {
+                    Button(onClick = {}) { Text("All apps") }
+                } else {
+                    OutlinedButton(onClick = { onRoutingMode(RoutingMode.ALL_APPS) }) { Text("All apps") }
+                }
+                if (routingMode == RoutingMode.SELECTED_APPS) {
+                    Button(onClick = {}) { Text("Selected apps") }
+                } else {
+                    OutlinedButton(onClick = { onRoutingMode(RoutingMode.SELECTED_APPS) }) { Text("Selected apps") }
                 }
             }
-            "Apps" -> {
-                Text("Apps routed through VPN", style = MaterialTheme.typography.titleLarge)
-                Text("Select which apps may use the VPN tunnel. Automatic connect-on-launch is planned for M3.")
+            Spacer(Modifier.height(16.dp))
+
+            Button(
+                Modifier.fillMaxWidth(),
+                onClick = onConnect,
+                enabled = configPresent && !state.isActive(),
+            ) { Text("Connect") }
+            Spacer(Modifier.height(8.dp))
+            OutlinedButton(
+                Modifier.fillMaxWidth(),
+                onClick = onDisconnect,
+                enabled = state is VpnState.Connected || state is VpnState.Connecting,
+            ) { Text("Disconnect") }
+
+            if (reconnectRequired) {
                 Spacer(Modifier.height(8.dp))
-                LazyColumn(modifier = Modifier.fillMaxSize()) {
-                    items(apps, key = { it.packageName }) { app ->
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            verticalAlignment = Alignment.CenterVertically,
-                        ) {
-                            Checkbox(
-                                checked = app.packageName in selectedApps,
-                                onCheckedChange = { viewModel.toggleApp(app.packageName) },
-                            )
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(app.label)
-                                Text(app.packageName, style = MaterialTheme.typography.bodySmall)
-                            }
-                        }
-                        HorizontalDivider()
-                    }
+                Button(Modifier.fillMaxWidth(), onClick = onApplyRouting) {
+                    Text("Reconnect with new routing")
                 }
             }
-            "Config" -> {
-                ConfigSection(
-                    configPresent = configPresent,
-                    onSave = { viewModel.setConfig(it) },
-                    onClear = viewModel::clearConfig,
-                )
+
+            if (state is VpnState.Connected) {
+                Spacer(Modifier.height(12.dp))
+                Text("Received: ${formatBytes(state.rxBytes)}")
+                Text("Sent: ${formatBytes(state.txBytes)}")
+            }
+            if (state is VpnState.Error) {
+                Spacer(Modifier.height(10.dp))
+                Text(state.message, color = MaterialTheme.colorScheme.error)
             }
         }
     }
 }
 
-@androidx.compose.runtime.Composable
+@Composable
+private fun AppsSection(
+    apps: List<com.blawhi3929bd.tunnelpilot.data.InstalledApp>,
+    selectedApps: Set<String>,
+    onToggle: (String) -> Unit,
+    onRefresh: () -> Unit,
+) {
+    var query by remember { mutableStateOf("") }
+    val filtered = apps.filter {
+        query.isBlank() || it.label.contains(query, ignoreCase = true) || it.packageName.contains(query, ignoreCase = true)
+    }
+
+    Text("Apps allowed to use the VPN", style = MaterialTheme.typography.titleLarge)
+    Text("Selected-apps mode keeps the VPN connection active, but Android routes only the selected apps through it.")
+    Spacer(Modifier.height(8.dp))
+    OutlinedTextField(
+        value = query,
+        onValueChange = { query = it },
+        Modifier.fillMaxWidth(),
+        label = { Text("Search apps") },
+    )
+    Spacer(Modifier.height(8.dp))
+    OutlinedButton(onClick = onRefresh, Modifier.fillMaxWidth()) { Text("Refresh app list") }
+    Spacer(Modifier.height(8.dp))
+    LazyColumn(Modifier.fillMaxSize()) {
+        items(filtered, key = { it.packageName }) { app ->
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Checkbox(
+                    checked = app.packageName in selectedApps,
+                    onCheckedChange = { onToggle(app.packageName) },
+                )
+                Column(Modifier.weight(1f)) {
+                    Text(app.label)
+                    Text(app.packageName, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            HorizontalDivider()
+        }
+    }
+}
+
+@Composable
 private fun ConfigSection(
     configPresent: Boolean,
     onSave: (String) -> Result<Unit>,
@@ -179,43 +241,35 @@ private fun ConfigSection(
         Text("WireGuard configuration", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(8.dp))
         Text(
-            if (configPresent) {
-                "A config is stored locally using Android Keystore encryption. Re-importing replaces it."
-            } else {
-                "Paste a client WireGuard configuration. Never paste a production private key into chat or commit it to Git."
-            },
+            if (configPresent) "Configuration is stored encrypted with Android Keystore."
+            else "Import a WireGuard client config. Do not paste production keys into chat or Git.",
         )
         Spacer(Modifier.height(12.dp))
         OutlinedTextField(
             value = text,
             onValueChange = { text = it },
-            modifier = Modifier
-                .fillMaxWidth()
-                .weight(1f, fill = false),
+            Modifier.fillMaxWidth(),
             minLines = 12,
+            label = { Text("[Interface] / [Peer]") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
             visualTransformation = VisualTransformation.None,
-            label = { Text("[Interface] / [Peer] config") },
         )
         Spacer(Modifier.height(12.dp))
         Button(
-            modifier = Modifier.fillMaxWidth(),
+            Modifier.fillMaxWidth(),
             onClick = {
                 val result = onSave(text)
-                message = result.fold({ "Config saved." }, { it.message ?: "Invalid config" })
+                message = result.fold({ "Configuration saved and validated." }, { it.message ?: "Invalid configuration" })
             },
             enabled = text.isNotBlank(),
-        ) { Text("Save config") }
+        ) { Text("Save configuration") }
         if (configPresent) {
             Spacer(Modifier.height(8.dp))
-            TextButton(
-                modifier = Modifier.fillMaxWidth(),
-                onClick = {
-                    onClear()
-                    text = ""
-                    message = "Saved config removed."
-                },
-            ) { Text("Delete saved config") }
+            TextButton(Modifier.fillMaxWidth(), onClick = {
+                onClear()
+                text = ""
+                message = "Saved configuration removed."
+            }) { Text("Delete saved configuration") }
         }
         message?.let {
             Spacer(Modifier.height(8.dp))
@@ -227,6 +281,23 @@ private fun ConfigSection(
 private fun stateLabel(state: VpnState): String = when (state) {
     VpnState.Disconnected -> "Disconnected"
     VpnState.Connecting -> "Connecting…"
-    VpnState.Connected -> "Connected"
+    is VpnState.Connected -> "Connected"
     is VpnState.Error -> "Error"
+}
+
+private fun routingDescription(mode: RoutingMode, selectedCount: Int): String = when (mode) {
+    RoutingMode.ALL_APPS -> "All applications use the VPN tunnel."
+    RoutingMode.SELECTED_APPS -> "$selectedCount selected app(s) use the VPN; other apps keep their normal network route."
+}
+
+private fun formatBytes(bytes: Long): String {
+    if (bytes < 1024) return "$bytes B"
+    val units = arrayOf("KB", "MB", "GB", "TB")
+    var value = bytes.toDouble()
+    var index = -1
+    while (value >= 1024 && index < units.lastIndex) {
+        value /= 1024
+        index++
+    }
+    return String.format(Locale.US, "%.1f %s", value, units[index])
 }

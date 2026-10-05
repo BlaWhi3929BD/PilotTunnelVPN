@@ -1,45 +1,38 @@
 # TunnelPilot architecture
 
-## Product
-
-TunnelPilot is a free Android VPN client with an eventual optional premium tier. The core experience is a real VPN connection; advertising must remain inside the TunnelPilot app and must never be used as a reason to manipulate or monetize traffic from other applications.
-
-## Components
-
 ```text
-Android app
-  ├── UI (Jetpack Compose)
-  ├── VPN permission / lifecycle
-  ├── WireGuard Android Tunnel Library
-  ├── Server selector
-  ├── Auto-VPN policy
-  └── Ads / analytics (later)
+Android client
+  ├─ Compose UI
+  ├─ Settings / app selection
+  ├─ Encrypted WireGuard config store
+  ├─ WireGuard Android Tunnel Library
+  └─ diagnostics / connection state
           │
           ▼
 Control plane API
-  ├── Device registration
-  ├── Short-lived client configuration issuance
-  ├── Server catalog
-  └── Health / capacity data
+  ├─ device registration
+  ├─ server catalog
+  ├─ short-lived config issuance
+  ├─ rate limiting
+  └─ peer rotation/revocation
           │
           ▼
 WireGuard gateways
 ```
 
-## Security principles
+## Routing model
 
-1. Never embed a long-lived private WireGuard key in the APK.
-2. Client configuration must be issued by the control plane and scoped to the device/account.
-3. The VPN tunnel must be encrypted end-to-end to the gateway.
-4. Ads are an app UX concern; they must not influence routing decisions.
-5. No traffic logging by default.
-6. Security scanning is required before release.
-7. Store policy requirements are part of the architecture, not a release-afterthought.
+The client supports:
 
-## Current milestone
+- `ALL_APPS`: normal full-tunnel WireGuard behavior.
+- `SELECTED_APPS`: WireGuard's Android allow-list; only listed packages use the tunnel.
 
-M0 creates the Android project, Compose shell, WireGuard library integration, permission flow, and fail-closed connection path. It intentionally does **not** connect to an invented or hard-coded server.
+The list is established before the tunnel starts. Updating it requires a reconnect.
 
-## Next milestone
+## Why we do not implement foreground-app surveillance
 
-Build the control plane and provision the first WireGuard gateway. Then issue a test configuration to the Android client and implement a real connect/disconnect path.
+A generic Android app should not rely on invasive foreground-app monitoring or accessibility abuse just to simulate an "auto VPN" toggle. The platform already provides a first-class per-app VPN model. TunnelPilot uses that model and can later add quick reconnect affordances without watching arbitrary app content.
+
+## Secrets
+
+Client private keys are device-side secrets. The control plane gets public keys only. Gateway private keys remain on gateways.

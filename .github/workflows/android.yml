@@ -1,4 +1,4 @@
-name: Android CI
+name: CI
 
 on:
   push:
@@ -8,7 +8,7 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  android:
     runs-on: ubuntu-latest
     steps:
       - name: Check out source
@@ -25,14 +25,38 @@ jobs:
         with:
           gradle-version: "9.3.1"
 
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
       - name: Install Android SDK components
-        shell: bash
-        run: |
-          set -euo pipefail
-          sdkmanager "platforms;android-37" "build-tools;36.0.0"
+        run: sdkmanager "platforms;android-37" "build-tools;36.0.0"
 
       - name: Run unit tests
         run: gradle :app:testDebugUnitTest --stacktrace
 
+      - name: Run Android lint
+        run: gradle :app:lintDebug --stacktrace
+
       - name: Build debug APK
         run: gradle :app:assembleDebug --stacktrace
+
+  server:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: "pip"
+
+      - name: Install server dependencies
+        run: pip install -r server/requirements-dev.txt
+
+      - name: Run server tests
+        run: pytest server/tests -q
+
+      - name: Check for obvious secrets
+        run: ./scripts/check-secrets.sh
