@@ -6,14 +6,16 @@ Android-first free VPN project.
 
 ## Current status
 
-**Milestone 0 — project bootstrap**
+**Milestone 0 — project bootstrap (local implementation complete)**
 
 - Kotlin + Android Gradle Plugin 9.1.1
 - Java 17
 - Jetpack Compose
 - WireGuard Android Tunnel Library 1.0.23
 - VPN permission request flow
-- Fail-closed connection path until a real control-plane configuration is available
+- real WireGuard connect/disconnect using an imported client configuration
+- per-app tunnel allow-list for the current VPN session
+- automatic connect-on-app-launch is intentionally not implemented yet
 - Initial unit test
 - Security/architecture notes
 

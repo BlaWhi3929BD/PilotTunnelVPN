@@ -83,7 +83,7 @@ private fun TunnelPilotScreen(
             .padding(20.dp),
     ) {
         Text("TunnelPilot", style = MaterialTheme.typography.headlineMedium)
-        Text("Android VPN MVP", style = MaterialTheme.typography.bodyMedium)
+        Text("Free WireGuard VPN · MVP", style = MaterialTheme.typography.bodyMedium)
         Spacer(Modifier.height(16.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -107,7 +107,7 @@ private fun TunnelPilotScreen(
                             if (selectedApps.isEmpty()) {
                                 "All applications use the tunnel."
                             } else {
-                                "Auto-VPN allow-list: ${selectedApps.size} app(s)"
+                                "VPN allow-list: ${selectedApps.size} app(s)"
                             },
                         )
                         Spacer(Modifier.height(16.dp))
@@ -134,7 +134,7 @@ private fun TunnelPilotScreen(
             }
             "Apps" -> {
                 Text("Apps routed through VPN", style = MaterialTheme.typography.titleLarge)
-                Text("Select apps for the Auto-VPN mode. Empty selection means all apps.")
+                Text("Select which apps may use the VPN tunnel. Automatic connect-on-launch is planned for M3.")
                 Spacer(Modifier.height(8.dp))
                 LazyColumn(modifier = Modifier.fillMaxSize()) {
                     items(apps, key = { it.packageName }) { app ->

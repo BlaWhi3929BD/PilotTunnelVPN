@@ -6,7 +6,7 @@
 - WireGuard Tunnel Library integration
 - VPN permission handling
 - local encrypted client-config storage
-- application allow-list editing
+- application allow-list editing (manual VPN session routing)
 
 ## M1 — real single-server VPN
 - provision one WireGuard gateway
