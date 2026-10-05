@@ -9,8 +9,13 @@ import com.blawhi3929bd.tunnelpilot.data.AppSettingsStore
 import com.blawhi3929bd.tunnelpilot.data.InstalledApp
 import com.blawhi3929bd.tunnelpilot.data.InstalledAppsRepository
 import com.blawhi3929bd.tunnelpilot.data.SecureConfigStore
+import com.blawhi3929bd.tunnelpilot.provisioning.ControlPlaneClient
+import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
+import com.blawhi3929bd.tunnelpilot.provisioning.SecureIdentityStore
+import com.blawhi3929bd.tunnelpilot.provisioning.WireGuardConfigFactory
 import com.wireguard.android.backend.BackendException
 import com.wireguard.config.Config
+import com.wireguard.crypto.TunnelPilotKeyGenerator
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -25,6 +30,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val manager = WireGuardManager(appContext)
     private val configStore = SecureConfigStore(appContext)
     private val settingsStore = AppSettingsStore(appContext)
+    private val identityStore = SecureIdentityStore(appContext)
     private val installedAppsRepository = InstalledAppsRepository(appContext)
 
     private val _state = MutableStateFlow<VpnState>(VpnState.Disconnected)
@@ -44,6 +50,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _reconnectRequired = MutableStateFlow(false)
     val reconnectRequired: StateFlow<Boolean> = _reconnectRequired.asStateFlow()
+
+    private val _controlPlaneUrl = MutableStateFlow(settingsStore.getControlPlaneUrl())
+    val controlPlaneUrl: StateFlow<String> = _controlPlaneUrl.asStateFlow()
+
+    private val _provisioningState = MutableStateFlow<ProvisioningState>(ProvisioningState.NotConfigured)
+    val provisioningState: StateFlow<ProvisioningState> = _provisioningState.asStateFlow()
 
     private var statsJob: Job? = null
 
@@ -72,6 +84,60 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         settingsStore.setSelectedApps(_selectedApps.value)
         markRoutingChanged()
+    }
+
+    fun setControlPlaneUrl(url: String) {
+        _controlPlaneUrl.value = url
+        settingsStore.setControlPlaneUrl(url)
+        if (_provisioningState.value is ProvisioningState.Error) {
+            _provisioningState.value = ProvisioningState.NotConfigured
+        }
+    }
+
+    fun provision() {
+        if (_state.value.isActive()) {
+            _provisioningState.value = ProvisioningState.Error("Disconnect the VPN before provisioning a new configuration")
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            _provisioningState.value = ProvisioningState.Provisioning
+            runCatching {
+                val privateKey = identityStore.loadPrivateKey() ?: TunnelPilotKeyGenerator
+                    .generatePrivateKey()
+                    .also { identityStore.savePrivateKey(it.toBase64()) }
+                    .toBase64()
+                val privateKeyObject = com.wireguard.crypto.Key.fromBase64(privateKey)
+                val publicKey = TunnelPilotKeyGenerator.generatePublicKey(privateKeyObject).toBase64()
+                val deviceId = identityStore.getOrCreateDeviceId()
+
+                val baseUrl = _controlPlaneUrl.value.trim()
+                require(baseUrl.isNotBlank()) { "Control plane URL is required" }
+
+                val registration = ControlPlaneClient(baseUrl).registerDevice(
+                    deviceId = deviceId,
+                    publicKey = publicKey,
+                    appVersion = BuildConfig.VERSION_NAME,
+                )
+                val config = WireGuardConfigFactory.create(
+                    privateKey = privateKey,
+                    clientAddress = registration.clientAddress,
+                    server = registration.server,
+                )
+                Config.parse(ByteArrayInputStream(config.toByteArray(Charsets.UTF_8)))
+                configStore.save(config)
+                _configPresent.value = true
+                _reconnectRequired.value = false
+                _provisioningState.value = ProvisioningState.Provisioned(
+                    deviceId = registration.deviceId,
+                    clientAddress = registration.clientAddress,
+                )
+            }.onFailure { error ->
+                _provisioningState.value = ProvisioningState.Error(
+                    error.message ?: "Unable to provision the device",
+                )
+            }
+        }
     }
 
     fun setConfig(rawConfig: String): Result<Unit> = runCatching {

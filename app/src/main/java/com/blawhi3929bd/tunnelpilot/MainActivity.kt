@@ -33,6 +33,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.collectAsState
+import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
@@ -79,6 +80,8 @@ private fun TunnelPilotScreen(
     val selectedApps by viewModel.selectedApps.collectAsState()
     val routingMode by viewModel.routingMode.collectAsState()
     val reconnectRequired by viewModel.reconnectRequired.collectAsState()
+    val controlPlaneUrl by viewModel.controlPlaneUrl.collectAsState()
+    val provisioningState by viewModel.provisioningState.collectAsState()
 
     Column(Modifier.fillMaxSize().padding(20.dp)) {
         Text("TunnelPilot", style = MaterialTheme.typography.headlineMedium)
@@ -86,7 +89,7 @@ private fun TunnelPilotScreen(
         Spacer(Modifier.height(16.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("VPN", "Apps", "Config").forEach { item ->
+            listOf("VPN", "Apps", "Config", "Setup").forEach { item ->
                 if (section == item) Button(onClick = { section = item }) { Text(item) }
                 else OutlinedButton(onClick = { section = item }) { Text(item) }
             }
@@ -115,6 +118,12 @@ private fun TunnelPilotScreen(
                 configPresent = configPresent,
                 onSave = viewModel::setConfig,
                 onClear = viewModel::clearConfig,
+            )
+            "Setup" -> SetupSection(
+                controlPlaneUrl = controlPlaneUrl,
+                provisioningState = provisioningState,
+                onControlPlaneUrl = viewModel::setControlPlaneUrl,
+                onProvision = viewModel::provision,
             )
         }
     }
@@ -156,20 +165,20 @@ private fun VpnSection(
             Spacer(Modifier.height(16.dp))
 
             Button(
-                modifier = Modifier.fillMaxWidth(),
+                Modifier.fillMaxWidth(),
                 onClick = onConnect,
                 enabled = configPresent && !state.isActive(),
             ) { Text("Connect") }
             Spacer(Modifier.height(8.dp))
             OutlinedButton(
-                modifier = Modifier.fillMaxWidth(),
+                Modifier.fillMaxWidth(),
                 onClick = onDisconnect,
                 enabled = state is VpnState.Connected || state is VpnState.Connecting,
             ) { Text("Disconnect") }
 
             if (reconnectRequired) {
                 Spacer(Modifier.height(8.dp))
-                Button(modifier = Modifier.fillMaxWidth(), onClick = onApplyRouting) {
+                Button(Modifier.fillMaxWidth(), onClick = onApplyRouting) {
                     Text("Reconnect with new routing")
                 }
             }
@@ -228,6 +237,56 @@ private fun AppsSection(
     }
 }
 
+
+@Composable
+private fun SetupSection(
+    controlPlaneUrl: String,
+    provisioningState: ProvisioningState,
+    onControlPlaneUrl: (String) -> Unit,
+    onProvision: () -> Unit,
+) {
+    Column {
+        Text("Automatic server setup", style = MaterialTheme.typography.titleLarge)
+        Spacer(Modifier.height(8.dp))
+        Text(
+            "TunnelPilot generates the WireGuard client key on this device, registers only the public key, " +
+                "and builds the encrypted client configuration from the gateway response.",
+        )
+        Spacer(Modifier.height(12.dp))
+        OutlinedTextField(
+            value = controlPlaneUrl,
+            onValueChange = onControlPlaneUrl,
+            modifier = Modifier.fillMaxWidth(),
+            label = { Text("Control plane URL") },
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+        )
+        Spacer(Modifier.height(12.dp))
+        Button(
+            modifier = Modifier.fillMaxWidth(),
+            onClick = onProvision,
+        ) {
+            Text("Provision device")
+        }
+        Spacer(Modifier.height(12.dp))
+        when (provisioningState) {
+            ProvisioningState.NotConfigured -> Text("Not provisioned yet.")
+            ProvisioningState.Provisioning -> Text("Provisioning…")
+            is ProvisioningState.Provisioned -> {
+                Text("Device ID: ${provisioningState.deviceId}")
+                Text("VPN address: ${provisioningState.clientAddress}")
+                Text("The generated configuration is stored encrypted locally.")
+            }
+            is ProvisioningState.Error -> {
+                Text(
+                    provisioningState.message,
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun ConfigSection(
     configPresent: Boolean,
@@ -248,7 +307,7 @@ private fun ConfigSection(
         OutlinedTextField(
             value = text,
             onValueChange = { text = it },
-            modifier = Modifier.fillMaxWidth(),
+            Modifier.fillMaxWidth(),
             minLines = 12,
             label = { Text("[Interface] / [Peer]") },
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
@@ -256,7 +315,7 @@ private fun ConfigSection(
         )
         Spacer(Modifier.height(12.dp))
         Button(
-            modifier = Modifier.fillMaxWidth(),
+            Modifier.fillMaxWidth(),
             onClick = {
                 val result = onSave(text)
                 message = result.fold({ "Configuration saved and validated." }, { it.message ?: "Invalid configuration" })
@@ -265,7 +324,7 @@ private fun ConfigSection(
         ) { Text("Save configuration") }
         if (configPresent) {
             Spacer(Modifier.height(8.dp))
-            TextButton(modifier = Modifier.fillMaxWidth(), onClick = {
+            TextButton(Modifier.fillMaxWidth(), onClick = {
                 onClear()
                 text = ""
                 message = "Saved configuration removed."

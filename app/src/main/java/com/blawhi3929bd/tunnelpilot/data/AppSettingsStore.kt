@@ -21,9 +21,17 @@ class AppSettingsStore(context: Context) {
         prefs.edit().putStringSet(KEY_SELECTED_APPS, packages.toSet()).apply()
     }
 
+    fun getControlPlaneUrl(): String = prefs.getString(KEY_CONTROL_PLANE_URL, DEFAULT_CONTROL_PLANE_URL).orEmpty()
+
+    fun setControlPlaneUrl(url: String) {
+        prefs.edit().putString(KEY_CONTROL_PLANE_URL, url.trim()).apply()
+    }
+
     private companion object {
         const val NAME = "tunnelpilot_settings"
         const val KEY_ROUTING_MODE = "routing_mode"
         const val KEY_SELECTED_APPS = "selected_apps"
+        const val KEY_CONTROL_PLANE_URL = "control_plane_url"
+        const val DEFAULT_CONTROL_PLANE_URL = "http://10.0.2.2:8000"
     }
 }

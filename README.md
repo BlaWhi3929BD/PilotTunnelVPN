@@ -12,6 +12,7 @@ TunnelPilot is an Android-first free WireGuard VPN client. The product goal is a
 - Live RX/TX counters while connected.
 - Configuration validation before storage.
 - Explicit reconnect flow when routing rules change.
+- Control-plane provisioning that generates the client key locally and receives only server/public routing data.
 - CI/build and unit-test foundation.
 
 ## Important product decision
