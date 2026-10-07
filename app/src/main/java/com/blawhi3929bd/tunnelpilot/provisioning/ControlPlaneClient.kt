@@ -12,7 +12,12 @@ class ControlPlaneClient(
     private val connectTimeoutMs: Int = 8_000,
     private val readTimeoutMs: Int = 8_000,
 ) {
-    fun registerDevice(deviceId: String, publicKey: String, appVersion: String): RegistrationResult {
+    fun registerDevice(
+        deviceId: String,
+        publicKey: String,
+        appVersion: String,
+        deviceToken: String? = null,
+    ): RegistrationResult {
         require(deviceId.isNotBlank()) { "Device ID is required" }
         require(publicKey.isNotBlank()) { "WireGuard public key is required" }
         require(appVersion.isNotBlank()) { "App version is required" }
@@ -25,6 +30,9 @@ class ControlPlaneClient(
             doOutput = true
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("Accept", "application/json")
+            if (!deviceToken.isNullOrBlank()) {
+                setRequestProperty("X-Device-Token", deviceToken)
+            }
         }
 
         return try {
@@ -85,6 +93,7 @@ class ControlPlaneClient(
                 publicKey = serverJson.getString("public_key"),
                 port = serverJson.getInt("port"),
             ),
+            deviceToken = json.optString("device_token").ifBlank { null },
         )
     }
 }

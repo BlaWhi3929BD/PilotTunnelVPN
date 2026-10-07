@@ -124,7 +124,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         deviceId = deviceId,
                         publicKey = publicKey,
                         appVersion = BuildConfig.VERSION_NAME,
+                        deviceToken = identityStore.loadDeviceToken(),
                     )
+                    registration.deviceToken?.let(identityStore::saveDeviceToken)
+
                     val config = WireGuardConfigFactory.create(
                         privateKey = privateKey,
                         clientAddress = registration.clientAddress,

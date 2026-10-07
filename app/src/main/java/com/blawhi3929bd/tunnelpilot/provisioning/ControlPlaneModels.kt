@@ -13,4 +13,5 @@ data class RegistrationResult(
     val clientAddress: String,
     val provisioned: Boolean,
     val server: RegisteredServer,
+    val deviceToken: String?,
 )

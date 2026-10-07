@@ -16,3 +16,5 @@ secret.properties
 __pycache__/
 *.py[cod]
 .pytest_cache/
+server/data/*.db
+server/data/*.db-*
