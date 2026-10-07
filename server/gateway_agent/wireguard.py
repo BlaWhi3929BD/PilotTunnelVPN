@@ -38,9 +38,9 @@ class WireGuardController:
     runner: Runner = subprocess.run
     timeout_seconds: float = 5.0
 
-    def _run(self, args: Sequence[str]) -> None:
+    def _run(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
         try:
-            self.runner(
+            return self.runner(
                 list(args),
                 check=True,
                 capture_output=True,
@@ -58,6 +58,10 @@ class WireGuardController:
 
     def ensure_available(self) -> None:
         self._run([self.binary, "show", self.interface])
+
+    def peer_count(self) -> int:
+        result = self._run([self.binary, "show", self.interface, "peers"])
+        return sum(1 for line in result.stdout.splitlines() if line.strip())
 
     def add_peer(self, public_key: str, allowed_ip: str) -> None:
         public_key = validate_public_key(public_key)

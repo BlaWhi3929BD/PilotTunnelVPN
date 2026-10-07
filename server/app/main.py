@@ -4,21 +4,28 @@ import base64
 import binascii
 import ipaddress
 import os
-from urllib.parse import quote
 from datetime import datetime, timezone
 from typing import Annotated
+from urllib.parse import quote
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title="TunnelPilot Control Plane", version="0.3.0")
+app = FastAPI(title="TunnelPilot Control Plane", version="0.4.0")
 
 CONTROL_PLANE_TOKEN = os.getenv("TUNNELPILOT_CONTROL_PLANE_TOKEN")
 GATEWAY_AGENT_URL = os.getenv("TUNNELPILOT_GATEWAY_AGENT_URL")
 GATEWAY_AGENT_TOKEN = os.getenv("TUNNELPILOT_GATEWAY_AGENT_TOKEN")
 VPN_ADDRESS_POOL = os.getenv("TUNNELPILOT_VPN_ADDRESS_POOL", "10.67.0.0/24")
 VPN_GATEWAY_ADDRESS = os.getenv("TUNNELPILOT_VPN_GATEWAY_ADDRESS", "10.67.0.1")
+SERVER_ID = os.getenv("TUNNELPILOT_SERVER_ID", "dev-1")
+SERVER_REGION = os.getenv("TUNNELPILOT_SERVER_REGION", "dev")
+SERVER_HOSTNAME = os.getenv("TUNNELPILOT_SERVER_HOSTNAME", "replace-with-real-gateway")
+SERVER_PUBLIC_KEY = os.getenv("TUNNELPILOT_SERVER_PUBLIC_KEY", "replace-with-gateway-public-key")
+SERVER_PORT = int(os.getenv("TUNNELPILOT_SERVER_PORT", "51820"))
+SERVER_ENABLED = os.getenv("TUNNELPILOT_SERVER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+GATEWAY_HEALTH_TIMEOUT = float(os.getenv("TUNNELPILOT_GATEWAY_HEALTH_TIMEOUT", "3.0"))
 
 
 class Server(BaseModel):
@@ -29,6 +36,10 @@ class Server(BaseModel):
     port: int = Field(default=51820, ge=1, le=65535)
     enabled: bool = True
     gateway_api_url: str | None = Field(default=None, exclude=True)
+    health_status: str = "unknown"
+    peer_count: int | None = None
+    peer_capacity: int | None = None
+    capacity_remaining: int | None = None
 
 
 class DeviceRegistration(BaseModel):
@@ -75,10 +86,12 @@ class DeviceRevocationResponse(BaseModel):
 
 SERVERS = [
     Server(
-        id="dev-1",
-        region="dev",
-        hostname="replace-with-real-gateway",
-        public_key="replace-with-gateway-public-key",
+        id=SERVER_ID,
+        region=SERVER_REGION,
+        hostname=SERVER_HOSTNAME,
+        public_key=SERVER_PUBLIC_KEY,
+        port=SERVER_PORT,
+        enabled=SERVER_ENABLED,
         gateway_api_url=GATEWAY_AGENT_URL,
     )
 ]
@@ -153,6 +166,78 @@ def _gateway_request(
         raise HTTPException(status_code=502, detail="Gateway agent is unreachable") from exc
 
 
+def _probe_gateway(server: Server) -> dict[str, int | str | bool]:
+    base_url = _gateway_url(server)
+    if not base_url:
+        return {
+            "status": "unconfigured",
+            "wireguard_available": False,
+            "peer_count": 0,
+            "peer_capacity": 0,
+            "capacity_remaining": 0,
+        }
+
+    try:
+        with httpx.Client(base_url=base_url.rstrip("/"), timeout=GATEWAY_HEALTH_TIMEOUT) as client:
+            response = client.get("/healthz")
+    except httpx.HTTPError:
+        return {
+            "status": "unreachable",
+            "wireguard_available": False,
+            "peer_count": 0,
+            "peer_capacity": 0,
+            "capacity_remaining": 0,
+        }
+
+    if response.status_code >= 300:
+        return {
+            "status": "degraded",
+            "wireguard_available": False,
+            "peer_count": 0,
+            "peer_capacity": 0,
+            "capacity_remaining": 0,
+        }
+
+    try:
+        payload = response.json()
+    except ValueError:
+        return {
+            "status": "degraded",
+            "wireguard_available": False,
+            "peer_count": 0,
+            "peer_capacity": 0,
+            "capacity_remaining": 0,
+        }
+
+    peer_count = int(payload.get("peer_count", 0))
+    peer_capacity = int(payload.get("peer_capacity", 0))
+    remaining = max(0, int(payload.get("capacity_remaining", peer_capacity - peer_count)))
+    wireguard_available = bool(payload.get("wireguard_available", False))
+    health_status = str(payload.get("status", "degraded"))
+    if not wireguard_available:
+        health_status = "degraded"
+
+    return {
+        "status": health_status,
+        "wireguard_available": wireguard_available,
+        "peer_count": peer_count,
+        "peer_capacity": peer_capacity,
+        "capacity_remaining": remaining,
+    }
+
+
+def _server_with_health(server: Server) -> Server:
+    health = _probe_gateway(server)
+    return server.model_copy(
+        update={
+            "health_status": health["status"],
+            "peer_count": health["peer_count"],
+            "peer_capacity": health["peer_capacity"],
+            "capacity_remaining": health["capacity_remaining"],
+        }
+    )
+
+
 def _provision_peer(server: Server, public_key: str, client_address: str) -> None:
     response = _gateway_request(
         "POST",
@@ -183,7 +268,16 @@ def healthz() -> dict[str, str]:
 
 @app.get("/v1/servers", response_model=list[Server])
 def list_servers() -> list[Server]:
-    return [server for server in SERVERS if server.enabled]
+    enabled = [server for server in SERVERS if server.enabled]
+    healthy = [_server_with_health(server) for server in enabled]
+    return sorted(
+        healthy,
+        key=lambda server: (
+            server.health_status not in {"ok", "full"},
+            -(server.capacity_remaining or 0),
+            server.id,
+        ),
+    )
 
 
 @app.post("/v1/devices", response_model=DeviceRegistrationResponse)
@@ -227,14 +321,13 @@ def register_device(
         _provision_peer(server, registration.client_public_key, client_address)
         provisioned = True
 
-    created_at = existing.created_at if existing is not None else now
     DEVICES[registration.device_id] = DeviceRecord(
         device_id=registration.device_id,
         client_public_key=registration.client_public_key,
         app_version=registration.app_version,
         server_id=server.id,
         client_address=client_address,
-        created_at=created_at,
+        created_at=existing.created_at if existing is not None else now,
         last_seen_at=now,
         provisioned=provisioned,
     )
@@ -245,7 +338,7 @@ def register_device(
         server=server,
         client_address=client_address,
         provisioned=provisioned,
-        registered_at=created_at,
+        registered_at=DEVICES[registration.device_id].created_at,
     )
 
 

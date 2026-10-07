@@ -30,3 +30,6 @@ class GatewayHealthResponse(BaseModel):
     status: str
     interface: str
     wireguard_available: bool
+    peer_count: int
+    peer_capacity: int
+    capacity_remaining: int

@@ -14,6 +14,7 @@ import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
 import com.blawhi3929bd.tunnelpilot.provisioning.SecureIdentityStore
 import com.blawhi3929bd.tunnelpilot.provisioning.WireGuardConfigFactory
 import com.wireguard.android.backend.BackendException
+import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
 import com.wireguard.crypto.TunnelPilotKeyGenerator
 import kotlinx.coroutines.Dispatchers
@@ -23,6 +24,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.io.ByteArrayInputStream
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -32,6 +35,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val settingsStore = AppSettingsStore(appContext)
     private val identityStore = SecureIdentityStore(appContext)
     private val installedAppsRepository = InstalledAppsRepository(appContext)
+    private val operationMutex = Mutex()
 
     private val _state = MutableStateFlow<VpnState>(VpnState.Disconnected)
     val state: StateFlow<VpnState> = _state.asStateFlow()
@@ -101,42 +105,44 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         viewModelScope.launch(Dispatchers.IO) {
-            _provisioningState.value = ProvisioningState.Provisioning
-            runCatching {
-                val privateKey = identityStore.loadPrivateKey() ?: run {
-                    val generated = TunnelPilotKeyGenerator.generatePrivateKey().toBase64()
-                    identityStore.savePrivateKey(generated)
-                    generated
+            operationMutex.withLock {
+                _provisioningState.value = ProvisioningState.Provisioning
+                runCatching {
+                    val privateKey = identityStore.loadPrivateKey() ?: run {
+                        val generated = TunnelPilotKeyGenerator.generatePrivateKey().toBase64()
+                        identityStore.savePrivateKey(generated)
+                        generated
+                    }
+                    val privateKeyObject = com.wireguard.crypto.Key.fromBase64(privateKey)
+                    val publicKey = TunnelPilotKeyGenerator.generatePublicKey(privateKeyObject).toBase64()
+                    val deviceId = identityStore.getOrCreateDeviceId()
+
+                    val baseUrl = _controlPlaneUrl.value.trim()
+                    require(baseUrl.isNotBlank()) { "Control plane URL is required" }
+
+                    val registration = ControlPlaneClient(baseUrl).registerDevice(
+                        deviceId = deviceId,
+                        publicKey = publicKey,
+                        appVersion = BuildConfig.VERSION_NAME,
+                    )
+                    val config = WireGuardConfigFactory.create(
+                        privateKey = privateKey,
+                        clientAddress = registration.clientAddress,
+                        server = registration.server,
+                    )
+                    Config.parse(ByteArrayInputStream(config.toByteArray(Charsets.UTF_8)))
+                    configStore.save(config)
+                    _configPresent.value = true
+                    _reconnectRequired.value = false
+                    _provisioningState.value = ProvisioningState.Provisioned(
+                        deviceId = registration.deviceId,
+                        clientAddress = registration.clientAddress,
+                    )
+                }.onFailure { error ->
+                    _provisioningState.value = ProvisioningState.Error(
+                        error.message ?: "Unable to provision the device",
+                    )
                 }
-                val privateKeyObject = com.wireguard.crypto.Key.fromBase64(privateKey)
-                val publicKey = TunnelPilotKeyGenerator.generatePublicKey(privateKeyObject).toBase64()
-                val deviceId = identityStore.getOrCreateDeviceId()
-
-                val baseUrl = _controlPlaneUrl.value.trim()
-                require(baseUrl.isNotBlank()) { "Control plane URL is required" }
-
-                val registration = ControlPlaneClient(baseUrl).registerDevice(
-                    deviceId = deviceId,
-                    publicKey = publicKey,
-                    appVersion = BuildConfig.VERSION_NAME,
-                )
-                val config = WireGuardConfigFactory.create(
-                    privateKey = privateKey,
-                    clientAddress = registration.clientAddress,
-                    server = registration.server,
-                )
-                Config.parse(ByteArrayInputStream(config.toByteArray(Charsets.UTF_8)))
-                configStore.save(config)
-                _configPresent.value = true
-                _reconnectRequired.value = false
-                _provisioningState.value = ProvisioningState.Provisioned(
-                    deviceId = registration.deviceId,
-                    clientAddress = registration.clientAddress,
-                )
-            }.onFailure { error ->
-                _provisioningState.value = ProvisioningState.Error(
-                    error.message ?: "Unable to provision the device",
-                )
             }
         }
     }
@@ -175,24 +181,53 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
 
         viewModelScope.launch(Dispatchers.IO) {
-            performConnect()
+            operationMutex.withLock {
+                performConnect()
+            }
         }
     }
 
     fun disconnect() {
-        statsJob?.cancel()
-        statsJob = null
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { manager.disconnect() }
-                .onSuccess { _state.value = VpnState.Disconnected }
-                .onFailure { setError(it.message ?: "Unable to disconnect") }
+            operationMutex.withLock {
+                disconnectAndWait()
+            }
         }
     }
 
     fun applyRoutingChanges() {
         viewModelScope.launch(Dispatchers.IO) {
-            runCatching { manager.disconnect() }
-            performConnect()
+            operationMutex.withLock {
+                if (!_state.value.isActive()) return@withLock
+                disconnectAndWait()
+                if (_state.value !is VpnState.Disconnected) return@withLock
+                performConnect()
+            }
+        }
+    }
+
+    private suspend fun disconnectAndWait() {
+        statsJob?.cancel()
+        statsJob = null
+        runCatching {
+            manager.disconnect()
+            waitForBackendState(Tunnel.State.DOWN)
+        }.onSuccess {
+            _state.value = VpnState.Disconnected
+            _reconnectRequired.value = false
+        }.onFailure {
+            setError(it.message ?: "Unable to disconnect")
+        }
+    }
+
+    private suspend fun waitForBackendState(target: Tunnel.State, timeoutMs: Long = 2_000) {
+        var waitedMs = 0L
+        while (manager.currentState() != target && waitedMs < timeoutMs) {
+            delay(50)
+            waitedMs += 50
+        }
+        check(manager.currentState() == target) {
+            "WireGuard backend did not reach ${target.name} state in time"
         }
     }
 
@@ -213,6 +248,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 ConfigEditor.withIncludedApplications(rawConfig, emptySet())
             }
             manager.connect(config)
+            waitForBackendState(Tunnel.State.UP)
             _reconnectRequired.value = false
             updateStats()
             startStatsPolling()

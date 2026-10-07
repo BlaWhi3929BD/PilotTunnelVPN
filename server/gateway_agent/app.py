@@ -7,11 +7,12 @@ from fastapi import FastAPI, Header, HTTPException, Query, status
 from .models import GatewayHealthResponse, PeerCreateRequest, PeerResponse
 from .wireguard import WireGuardController
 
-app = FastAPI(title="TunnelPilot Gateway Agent", version="0.1.0")
+app = FastAPI(title="TunnelPilot Gateway Agent", version="0.2.0")
 
 GATEWAY_AGENT_TOKEN = os.getenv("TUNNELPILOT_GATEWAY_AGENT_TOKEN")
 WG_INTERFACE = os.getenv("TUNNELPILOT_WG_INTERFACE", "tunnelpilot0")
 WG_BINARY = os.getenv("TUNNELPILOT_WG_BINARY", "wg")
+WG_MAX_PEERS = max(1, int(os.getenv("TUNNELPILOT_WG_MAX_PEERS", "240")))
 
 controller = WireGuardController(interface=WG_INTERFACE, binary=WG_BINARY)
 
@@ -30,16 +31,25 @@ def _require_auth(authorization: str | None) -> None:
 def healthz() -> GatewayHealthResponse:
     try:
         controller.ensure_available()
+        peer_count = controller.peer_count()
     except RuntimeError:
         return GatewayHealthResponse(
             status="degraded",
             interface=WG_INTERFACE,
             wireguard_available=False,
+            peer_count=0,
+            peer_capacity=WG_MAX_PEERS,
+            capacity_remaining=0,
         )
+
+    capacity_remaining = max(0, WG_MAX_PEERS - peer_count)
     return GatewayHealthResponse(
-        status="ok",
+        status="full" if capacity_remaining == 0 else "ok",
         interface=WG_INTERFACE,
         wireguard_available=True,
+        peer_count=peer_count,
+        peer_capacity=WG_MAX_PEERS,
+        capacity_remaining=capacity_remaining,
     )
 
 
