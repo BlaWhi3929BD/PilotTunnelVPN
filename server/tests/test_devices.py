@@ -259,6 +259,127 @@ def test_revoke_device_removes_provisioned_peer(monkeypatch) -> None:
     assert ("DELETE", f"/v1/peers?public_key={VALID_PUBLIC_KEY[:-1]}%3D") in calls
 
 
+def test_revoke_device_with_device_token_succeeds(monkeypatch) -> None:
+    main.GATEWAY_AGENT_URL = "http://gateway-agent.test"
+    main.GATEWAY_AGENT_TOKEN = "gateway-token"
+    main.SERVERS[0].gateway_api_url = "http://gateway-agent.test"
+    main.CONTROL_PLANE_TOKEN = None
+
+    class LocalResponse:
+        def __init__(self, status_code: int = 200, text: str = "ok"):
+            self.status_code = status_code
+            self.text = text
+
+        def json(self):
+            return {
+                "status": "ok",
+                "wireguard_available": True,
+                "peer_count": 0,
+                "peer_capacity": 240,
+                "capacity_remaining": 240,
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path):
+            return LocalResponse()
+
+        def request(self, method, path, *, headers, json=None):
+            return LocalResponse()
+
+    monkeypatch.setattr(main.httpx, "Client", FakeClient)
+
+    created = client.post("/v1/devices", json=registration())
+    assert created.status_code == 200
+    token = created.json()["device_token"]
+
+    # Anonymous revoke is rejected with 401
+    anonymous = client.delete("/v1/devices/device-1234")
+    assert anonymous.status_code == 401
+
+    # Invalid device token is rejected with 401
+    bad_token = client.delete("/v1/devices/device-1234", headers={"X-Device-Token": "bad-token"})
+    assert bad_token.status_code == 401
+
+    # Valid device token succeeds
+    revoked = client.delete("/v1/devices/device-1234", headers={"X-Device-Token": token})
+    assert revoked.status_code == 200
+    assert main.DEVICE_STORE.get("device-1234") is None
+
+
+def test_revoke_device_gateway_failure_retains_record_unless_forced(monkeypatch) -> None:
+    main.GATEWAY_AGENT_URL = "http://gateway-agent.test"
+    main.GATEWAY_AGENT_TOKEN = "gateway-token"
+    main.SERVERS[0].gateway_api_url = "http://gateway-agent.test"
+    main.CONTROL_PLANE_TOKEN = "admin-token"
+
+    class LocalResponse:
+        def __init__(self, status_code: int = 200, text: str = "ok"):
+            self.status_code = status_code
+            self.text = text
+
+        def json(self):
+            return {
+                "status": "ok",
+                "wireguard_available": True,
+                "peer_count": 0,
+                "peer_capacity": 240,
+                "capacity_remaining": 240,
+            }
+
+    class FlakyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path):
+            return LocalResponse()
+
+        def request(self, method, path, *, headers, json=None):
+            if method == "DELETE":
+                return LocalResponse(status_code=502, text="Gateway offline")
+            return LocalResponse(status_code=200)
+
+    monkeypatch.setattr(main.httpx, "Client", FlakyClient)
+
+    created = client.post(
+        "/v1/devices",
+        json=registration(),
+        headers={"Authorization": "Bearer admin-token"},
+    )
+    assert created.status_code == 200
+    token = created.json()["device_token"]
+
+    # 1. Gateway fails -> returns 502, device record is NOT deleted
+    failed = client.delete(
+        "/v1/devices/device-1234",
+        headers={"X-Device-Token": token},
+    )
+    assert failed.status_code == 502
+    assert main.DEVICE_STORE.get("device-1234") is not None
+
+    # 2. Force delete -> returns 200, record is deleted
+    forced = client.delete(
+        "/v1/devices/device-1234?force=true",
+        headers={"Authorization": "Bearer admin-token"},
+    )
+    assert forced.status_code == 200
+    assert main.DEVICE_STORE.get("device-1234") is None
+
+
 def test_rotate_device_key_requires_device_token_and_replaces_gateway_peer(monkeypatch) -> None:
     main.GATEWAY_AGENT_URL = "http://gateway-agent.test"
     main.GATEWAY_AGENT_TOKEN = "gateway-token"

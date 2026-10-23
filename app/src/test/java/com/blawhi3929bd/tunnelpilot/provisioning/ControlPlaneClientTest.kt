@@ -136,4 +136,36 @@ class ControlPlaneClientTest {
             deviceToken = "bad-token",
         )
     }
+
+    @Test
+    fun revokeDevice_success() {
+        var receivedTokenHeader: String? = null
+        server.createContext("/v1/devices/dev-1") { exchange ->
+            receivedTokenHeader = exchange.requestHeaders.getFirst("X-Device-Token")
+            val response = """{"status": "revoked", "device_id": "dev-1"}"""
+            val bytes = response.toByteArray(Charsets.UTF_8)
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.write(bytes)
+            exchange.close()
+        }
+
+        val client = ControlPlaneClient("http://127.0.0.1:$serverPort")
+        val success = client.revokeDevice("dev-1", "my-token")
+        assertTrue(success)
+        assertEquals("my-token", receivedTokenHeader)
+    }
+
+    @Test(expected = IllegalStateException::class)
+    fun revokeDevice_serverErrorThrows() {
+        server.createContext("/v1/devices/dev-1") { exchange ->
+            val error = """{"detail": "Gateway peer removal failed"}"""
+            val bytes = error.toByteArray(Charsets.UTF_8)
+            exchange.sendResponseHeaders(502, bytes.size.toLong())
+            exchange.responseBody.write(bytes)
+            exchange.close()
+        }
+
+        val client = ControlPlaneClient("http://127.0.0.1:$serverPort")
+        client.revokeDevice("dev-1", "my-token")
+    }
 }

@@ -538,23 +538,53 @@ def rotate_device_key(
     )
 
 
+def _require_revocation_auth(
+    record: DeviceRecord,
+    authorization: str | None,
+    device_token: str | None,
+) -> None:
+    if CONTROL_PLANE_TOKEN is not None and authorization == f"Bearer {CONTROL_PLANE_TOKEN}":
+        return
+
+    if (
+        device_token
+        and record.device_token_hash
+        and hmac.compare_digest(record.device_token_hash, _token_hash(device_token))
+    ):
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Unauthorized: requires admin Bearer token or valid X-Device-Token",
+    )
+
+
 @app.delete("/v1/devices/{device_id}", response_model=DeviceRevocationResponse)
 def revoke_device(
     device_id: str,
     authorization: Annotated[str | None, Header()] = None,
+    x_device_token: Annotated[str | None, Header()] = None,
+    force: bool = False,
 ) -> DeviceRevocationResponse:
-    _require_control_plane_auth(authorization)
-
     record = _load_record(device_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Device not found")
 
+    _require_revocation_auth(record, authorization, x_device_token)
+
     server = next((item for item in SERVERS if item.id == record.server_id), None)
-    if server is None:
+    if server is None and not force:
         raise HTTPException(status_code=503, detail="Assigned VPN server is unavailable")
 
-    if record.provisioned and _gateway_url(server):
-        _revoke_peer(server, record.client_public_key)
+    if record.provisioned and server and _gateway_url(server):
+        try:
+            _revoke_peer(server, record.client_public_key)
+        except Exception as exc:
+            if not force:
+                raise HTTPException(
+                    status_code=502,
+                    detail="Gateway peer removal failed. Use force=true to override.",
+                ) from exc
 
     DEVICE_STORE.delete(device_id)
     DEVICES.pop(device_id, None)

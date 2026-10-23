@@ -103,6 +103,34 @@ class ControlPlaneClient(
         }
     }
 
+    fun revokeDevice(
+        deviceId: String,
+        deviceToken: String,
+    ): Boolean {
+        require(deviceId.isNotBlank()) { "Device ID is required" }
+        require(deviceToken.isNotBlank()) { "Device token is required" }
+
+        val url = endpoint("/v1/devices/$deviceId")
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "DELETE"
+            connectTimeout = connectTimeoutMs
+            readTimeout = readTimeoutMs
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("X-Device-Token", deviceToken)
+        }
+
+        return try {
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299 && responseCode != 404) {
+                val responseBody = readResponseBody(connection, responseCode)
+                throw IllegalStateException(parseError(responseBody, responseCode))
+            }
+            true
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     private fun endpoint(path: String): URL {
         val normalized = baseUrl.trim().removeSuffix("/")
         require(normalized.isNotBlank()) { "Control plane URL is required" }

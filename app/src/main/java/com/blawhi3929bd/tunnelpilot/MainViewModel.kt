@@ -232,9 +232,24 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun clearConfig() {
         disconnect()
-        configStore.clear()
-        _configPresent.value = false
-        _reconnectRequired.value = false
+        viewModelScope.launch(Dispatchers.IO) {
+            operationMutex.withLock {
+                val deviceId = identityStore.getOrCreateDeviceId()
+                val token = identityStore.loadDeviceToken()
+                val baseUrl = _controlPlaneUrl.value.trim()
+                if (token != null && baseUrl.isNotBlank()) {
+                    runCatching {
+                        ControlPlaneClient(baseUrl).revokeDevice(deviceId, token)
+                    }
+                }
+                configStore.clear()
+                identityStore.clearDeviceToken()
+                identityStore.clearPrivateKey()
+                _configPresent.value = false
+                _reconnectRequired.value = false
+                _provisioningState.value = ProvisioningState.NotConfigured
+            }
+        }
     }
 
     fun connect() {
