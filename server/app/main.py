@@ -15,8 +15,8 @@ from typing import Annotated
 from urllib.parse import quote
 
 import httpx
-from fastapi import FastAPI, Header, HTTPException, status
-from pydantic import BaseModel, Field, field_validator
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, status
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .storage import DeviceStore
 
@@ -140,6 +140,14 @@ class DeviceRotationResponse(BaseModel):
     client_address: str
     provisioned: bool
     server: Server
+
+
+class ReconcileOptions(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    dry_run: bool | None = None
+    prune_unknown: bool | None = None
+    confirm_empty_db: bool | None = None
 
 
 class ServerReconcileReport(BaseModel):
@@ -649,21 +657,69 @@ def list_servers() -> list[Server]:
     )
 
 
+_ALLOWED_RECONCILE_QUERY_PARAMS = {"dry_run", "prune_unknown", "confirm_empty_db"}
+
+
+def _resolve_reconcile_options(
+    request: Request,
+    options: ReconcileOptions | None,
+    dry_run: bool | None,
+    prune_unknown: bool | None,
+    confirm_empty_db: bool | None,
+) -> tuple[bool, bool, bool]:
+    unknown_query = sorted(set(request.query_params.keys()) - _ALLOWED_RECONCILE_QUERY_PARAMS)
+    if unknown_query:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown reconciliation query parameter(s): {', '.join(unknown_query)}",
+        )
+
+    def _merge(name: str, query_val: bool | None, body_val: bool | None) -> bool:
+        if query_val is not None and body_val is not None and query_val != body_val:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Conflicting values for '{name}' between query parameter and JSON body",
+            )
+        if query_val is not None:
+            return query_val
+        if body_val is not None:
+            return body_val
+        return False
+
+    resolved_dry_run = _merge("dry_run", dry_run, options.dry_run if options else None)
+    resolved_prune = _merge("prune_unknown", prune_unknown, options.prune_unknown if options else None)
+    resolved_confirm = _merge(
+        "confirm_empty_db",
+        confirm_empty_db,
+        options.confirm_empty_db if options else None,
+    )
+    return resolved_dry_run, resolved_prune, resolved_confirm
+
+
 @app.post("/v1/servers/reconcile", response_model=list[ServerReconcileReport])
 def reconcile_servers(
+    request: Request,
+    options: Annotated[ReconcileOptions | None, Body()] = None,
     authorization: Annotated[str | None, Header()] = None,
-    dry_run: bool = False,
-    prune_unknown: bool = False,
-    confirm_empty_db: bool = False,
+    dry_run: Annotated[bool | None, Query()] = None,
+    prune_unknown: Annotated[bool | None, Query()] = None,
+    confirm_empty_db: Annotated[bool | None, Query()] = None,
 ) -> list[ServerReconcileReport]:
     _require_admin_auth(authorization)
+    resolved_dry_run, resolved_prune, resolved_confirm = _resolve_reconcile_options(
+        request,
+        options,
+        dry_run,
+        prune_unknown,
+        confirm_empty_db,
+    )
     enabled = [server for server in SERVERS if server.enabled]
     return [
         _reconcile_server(
             server,
-            dry_run=dry_run,
-            prune_unknown=prune_unknown,
-            confirm_empty_db=confirm_empty_db,
+            dry_run=resolved_dry_run,
+            prune_unknown=resolved_prune,
+            confirm_empty_db=resolved_confirm,
         )
         for server in enabled
     ]
@@ -672,20 +728,29 @@ def reconcile_servers(
 @app.post("/v1/servers/{server_id}/reconcile", response_model=ServerReconcileReport)
 def reconcile_single_server(
     server_id: str,
+    request: Request,
+    options: Annotated[ReconcileOptions | None, Body()] = None,
     authorization: Annotated[str | None, Header()] = None,
-    dry_run: bool = False,
-    prune_unknown: bool = False,
-    confirm_empty_db: bool = False,
+    dry_run: Annotated[bool | None, Query()] = None,
+    prune_unknown: Annotated[bool | None, Query()] = None,
+    confirm_empty_db: Annotated[bool | None, Query()] = None,
 ) -> ServerReconcileReport:
     _require_admin_auth(authorization)
+    resolved_dry_run, resolved_prune, resolved_confirm = _resolve_reconcile_options(
+        request,
+        options,
+        dry_run,
+        prune_unknown,
+        confirm_empty_db,
+    )
     server = next((item for item in SERVERS if item.id == server_id and item.enabled), None)
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")
     return _reconcile_server(
         server,
-        dry_run=dry_run,
-        prune_unknown=prune_unknown,
-        confirm_empty_db=confirm_empty_db,
+        dry_run=resolved_dry_run,
+        prune_unknown=resolved_prune,
+        confirm_empty_db=resolved_confirm,
     )
 
 

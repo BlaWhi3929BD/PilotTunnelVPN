@@ -676,19 +676,71 @@ def test_reconcile_server_is_non_destructive_by_default_and_supports_dry_run(mon
     gateway_peers[stale_key] = ["10.67.0.99/32"]
     gateway_peers[foreign_key] = ["192.168.50.10/32"]
 
-    # 1. Dry-run with prune_unknown=true reports what would happen without touching gateway_peers
+    # 1a. Dry-run via query params with prune_unknown=true reports what would happen without touching gateway_peers
+    calls.clear()
     dry = client.post("/v1/servers/reconcile?dry_run=true&prune_unknown=true", headers=admin_headers)
     assert dry.status_code == 200
     dry_report = dry.json()[0]
     assert dry_report["status"] == "dry_run"
+    assert dry_report["dry_run"] is True
+    assert dry_report["prune_unknown"] is True
     assert dry_report["restored_peers"] == 0
     assert dry_report["removed_peers"] == 0
     assert dry_report["would_restore_peers"] == 1
     assert dry_report["would_remove_peers"] == 1
     assert dry_report["unknown_peers"] == 1
     assert dry_report["unmanaged_peers"] == 1
+    assert [m for m, _, _ in calls] == ["GET"]
     assert VALID_PUBLIC_KEY not in gateway_peers
     assert stale_key in gateway_peers
+
+    # 1b. Dry-run via JSON body on both /v1/servers/reconcile and /v1/servers/{server_id}/reconcile
+    calls.clear()
+    dry_body = client.post(
+        "/v1/servers/reconcile",
+        json={"dry_run": True, "prune_unknown": True},
+        headers=admin_headers,
+    )
+    assert dry_body.status_code == 200
+    assert dry_body.json()[0]["status"] == "dry_run"
+    assert dry_body.json()[0]["dry_run"] is True
+    assert dry_body.json()[0]["would_restore_peers"] == 1
+    assert dry_body.json()[0]["would_remove_peers"] == 1
+    assert [m for m, _, _ in calls] == ["GET"]
+
+    calls.clear()
+    dry_single_body = client.post(
+        f"/v1/servers/{main.SERVERS[0].id}/reconcile",
+        json={"dry_run": True},
+        headers=admin_headers,
+    )
+    assert dry_single_body.status_code == 200
+    assert dry_single_body.json()["status"] == "dry_run"
+    assert dry_single_body.json()["dry_run"] is True
+    assert dry_single_body.json()["would_restore_peers"] == 1
+    assert dry_single_body.json()["would_remove_peers"] == 0
+    assert [m for m, _, _ in calls] == ["GET"]
+
+    # 1c. Reject typos in query params or JSON body and conflicting query+body values without touching gateway
+    calls.clear()
+    typo_body = client.post(
+        "/v1/servers/reconcile",
+        json={"dryRun": True},
+        headers=admin_headers,
+    )
+    typo_query = client.post(
+        "/v1/servers/reconcile?dryRun=true",
+        headers=admin_headers,
+    )
+    conflict_opts = client.post(
+        "/v1/servers/reconcile?dry_run=false",
+        json={"dry_run": True},
+        headers=admin_headers,
+    )
+    assert typo_body.status_code == 422
+    assert typo_query.status_code == 422
+    assert conflict_opts.status_code == 400
+    assert calls == []
 
     # 2. Default reconcile (prune_unknown=false) restores missing peer and NEVER deletes unknown peers
     safe_reconcile = client.post("/v1/servers/reconcile", headers=admin_headers)
@@ -750,9 +802,30 @@ def test_reconcile_server_blocks_pruning_against_empty_db_without_confirmation(m
     monkeypatch.setattr(main.httpx, "Client", FakeGatewayClient)
     admin_headers = {"Authorization": "Bearer secret-admin-token"}
 
+    # DB has 0 devices, but gateway has active_key -> dry_run without prune_unknown reports unknown_peers safely
+    empty_dry = client.post(
+        "/v1/servers/reconcile",
+        json={"dry_run": True},
+        headers=admin_headers,
+    )
+    assert empty_dry.status_code == 200
+    assert empty_dry.json()[0]["status"] == "dry_run"
+    assert empty_dry.json()[0]["dry_run"] is True
+    assert empty_dry.json()[0]["unknown_peers"] == 1
+    assert empty_dry.json()[0]["removed_peers"] == 0
+    assert active_key in gateway_peers
+
     # DB has 0 devices, but gateway has active_key -> prune_unknown=true is blocked with 409!
     blocked = client.post("/v1/servers/reconcile?prune_unknown=true", headers=admin_headers)
     assert blocked.status_code == 409
+    assert active_key in gateway_peers
+
+    blocked_dry_prune = client.post(
+        "/v1/servers/reconcile",
+        json={"dry_run": True, "prune_unknown": True},
+        headers=admin_headers,
+    )
+    assert blocked_dry_prune.status_code == 409
     assert active_key in gateway_peers
 
     # With explicit confirm_empty_db=true, pruning is allowed
@@ -873,5 +946,107 @@ def test_production_runtime_configuration_rejects_dangerous_defaults() -> None:
 
     main.SERVERS[0].public_key = VALID_PUBLIC_KEY
     main._validate_runtime_configuration()
+
+
+def test_reconcile_end_to_end_with_gateway_agent_app(monkeypatch) -> None:
+    import subprocess
+    from server.gateway_agent import app as gw_app
+    from server.gateway_agent.wireguard import WireGuardController
+
+    main.CONTROL_PLANE_TOKEN = "secret-admin-token"
+    main.GATEWAY_AGENT_URL = "http://gateway-agent.local"
+    main.GATEWAY_AGENT_TOKEN = "gw-secret-token"
+    main.SERVERS[0].gateway_api_url = "http://gateway-agent.local"
+    monkeypatch.setattr(gw_app, "GATEWAY_AGENT_TOKEN", "gw-secret-token")
+    monkeypatch.setattr(gw_app, "WG_INTERFACE", "tunnelpilot0")
+
+    gw_peers: dict[str, list[str]] = {
+        base64.b64encode(b"\x55" * 32).decode("ascii"): ["10.67.0.88/32"],
+    }
+    mutation_calls: list[tuple[str, str]] = []
+
+    def fake_runner(cmd, **kwargs):
+        # cmd formats:
+        # ['wg', 'show', 'tunnelpilot0', 'peers']
+        # ['wg', 'show', 'tunnelpilot0', 'allowed-ips']
+        # ['wg', 'set', 'tunnelpilot0', 'peer', <key>, 'allowed-ips', <cidr>]
+        # ['wg', 'set', 'tunnelpilot0', 'peer', <key>, 'remove']
+        if cmd[1:4] == ["show", "tunnelpilot0", "peers"]:
+            out = "\n".join(sorted(gw_peers.keys())) + ("\n" if gw_peers else "")
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=out, stderr="")
+        if cmd[1:4] == ["show", "tunnelpilot0", "allowed-ips"]:
+            lines = [f"{k}\t{' '.join(v)}" for k, v in sorted(gw_peers.items())]
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="\n".join(lines) + "\n", stderr="")
+        if cmd[1:4] == ["set", "tunnelpilot0", "peer"]:
+            pub = cmd[4]
+            if cmd[5] == "remove":
+                mutation_calls.append(("remove", pub))
+                gw_peers.pop(pub, None)
+            elif cmd[5] == "allowed-ips":
+                mutation_calls.append(("add", pub))
+                gw_peers[pub] = [cmd[6]]
+            return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        gw_app,
+        "controller",
+        WireGuardController(interface="tunnelpilot0", runner=fake_runner),
+    )
+
+    gw_client = TestClient(gw_app.app)
+
+    class BridgeGatewayClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path):
+            return gw_client.get(path)
+
+        def request(self, method, path, *, headers=None, json=None):
+            return gw_client.request(method, path, headers=headers, json=json)
+
+        def delete(self, path, *, headers=None):
+            return gw_client.delete(path, headers=headers)
+
+    monkeypatch.setattr(main.httpx, "Client", BridgeGatewayClient)
+    admin_headers = {"Authorization": "Bearer secret-admin-token"}
+
+    # Register a device (adds VALID_PUBLIC_KEY to gw_peers)
+    created = client.post(
+        "/v1/devices",
+        json=registration(device_id="device-e2e", public_key=VALID_PUBLIC_KEY),
+        headers=admin_headers,
+    )
+    assert created.status_code == 200
+    # Simulate gateway restart where VALID_PUBLIC_KEY is missing from kernel but stale peer remains
+    gw_peers.pop(VALID_PUBLIC_KEY, None)
+    mutation_calls.clear()
+
+    # Dry-run via JSON body against real gateway_agent FastAPI app
+    dry_resp = client.post(
+        "/v1/servers/reconcile",
+        json={"dry_run": True, "prune_unknown": True},
+        headers=admin_headers,
+    )
+    assert dry_resp.status_code == 200
+    report = dry_resp.json()[0]
+    assert report["status"] == "dry_run"
+    assert report["dry_run"] is True
+    assert report["prune_unknown"] is True
+    assert report["restored_peers"] == 0
+    assert report["removed_peers"] == 0
+    assert report["would_restore_peers"] == 1
+    assert report["would_remove_peers"] == 1
+    assert report["unknown_peers"] == 1
+    assert mutation_calls == []
+    assert VALID_PUBLIC_KEY not in gw_peers
+
 
 
