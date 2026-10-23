@@ -113,3 +113,25 @@ def test_gateway_auth_rejects_missing_or_wrong_token(monkeypatch) -> None:
         gateway_app.list_peers(authorization="Bearer wrong-token")
     assert exc_wrong.value.status_code == 401
 
+
+def test_gateway_startup_validation_enforces_managed_interface_and_production_token(monkeypatch) -> None:
+    monkeypatch.setattr(
+        gateway_app,
+        "controller",
+        WireGuardController(interface="wg0", allow_nonstandard_interface=False),
+    )
+    with pytest.raises(ValueError, match="non-TunnelPilot"):
+        gateway_app._validate_gateway_configuration()
+
+    monkeypatch.setattr(
+        gateway_app,
+        "controller",
+        WireGuardController(interface="tunnelpilot0", allow_nonstandard_interface=False),
+    )
+    monkeypatch.setattr(gateway_app, "ENVIRONMENT", "production")
+    monkeypatch.setattr(gateway_app, "GATEWAY_AGENT_TOKEN", None)
+    with pytest.raises(RuntimeError, match="TUNNELPILOT_GATEWAY_AGENT_TOKEN"):
+        gateway_app._validate_gateway_configuration()
+
+    monkeypatch.setattr(gateway_app, "GATEWAY_AGENT_TOKEN", "prod-gateway-token")
+    gateway_app._validate_gateway_configuration()

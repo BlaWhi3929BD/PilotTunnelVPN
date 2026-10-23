@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 import hmac
 import os
 
@@ -8,8 +10,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, status
 from .models import GatewayHealthResponse, PeerCreateRequest, PeerListResponse, PeerResponse
 from .wireguard import WireGuardController
 
-app = FastAPI(title="TunnelPilot Gateway Agent", version="0.2.0")
-
+ENVIRONMENT = os.getenv("TUNNELPILOT_ENV", "development").strip().lower()
 GATEWAY_AGENT_TOKEN = os.getenv("TUNNELPILOT_GATEWAY_AGENT_TOKEN")
 WG_INTERFACE = os.getenv("TUNNELPILOT_WG_INTERFACE", "tunnelpilot0")
 WG_BINARY = os.getenv("TUNNELPILOT_WG_BINARY", "wg")
@@ -23,6 +24,22 @@ controller = WireGuardController(
     binary=WG_BINARY,
     allow_nonstandard_interface=ALLOW_NONSTANDARD_WG_INTERFACE,
 )
+
+
+def _validate_gateway_configuration() -> None:
+    controller.ensure_managed_interface()
+    if ENVIRONMENT == "production":
+        if not GATEWAY_AGENT_TOKEN or not GATEWAY_AGENT_TOKEN.strip():
+            raise RuntimeError("TUNNELPILOT_GATEWAY_AGENT_TOKEN must be configured in production")
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    _validate_gateway_configuration()
+    yield
+
+
+app = FastAPI(title="TunnelPilot Gateway Agent", version="0.2.0", lifespan=_lifespan)
 
 
 def _require_auth(authorization: str | None) -> None:

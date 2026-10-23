@@ -24,6 +24,8 @@ def isolated_store(tmp_path, monkeypatch) -> None:
     main.ENVIRONMENT = "development"
     main.ALLOW_OPEN_REGISTRATION = False
     main.ALLOW_NONSTANDARD_WG_INTERFACE = False
+    main.REQUIRE_HTTPS = True
+    main.ALLOW_INSECURE_GATEWAY_HTTP = False
     main.VPN_ADDRESS_POOL = "10.67.0.0/24"
     main.VPN_GATEWAY_ADDRESS = "10.67.0.1"
     main.SERVERS[0].enabled = True
@@ -1198,5 +1200,61 @@ def test_open_registration_never_bypasses_admin_auth_on_reconcile_or_revocation(
     assert main.DEVICE_STORE.get("device-open") is None
 
 
+def test_production_runtime_configuration_rejects_same_tokens_and_insecure_remote_gateway() -> None:
+    main.ENVIRONMENT = "production"
+    main.CONTROL_PLANE_TOKEN = "shared-secret-token"
+    main.GATEWAY_AGENT_TOKEN = "shared-secret-token"
+    main.GATEWAY_AGENT_URL = "http://127.0.0.1:8787"
+    main.SERVERS[0].gateway_api_url = "http://127.0.0.1:8787"
+    main.SERVERS[0].hostname = "vpn.example.com"
+    main.SERVERS[0].public_key = VALID_PUBLIC_KEY
+
+    with pytest.raises(RuntimeError, match="must be distinct"):
+        main._validate_runtime_configuration()
+
+    main.GATEWAY_AGENT_TOKEN = "distinct-gateway-secret"
+    main.SERVERS[0].gateway_api_url = "http://203.0.113.10:8787"
+    with pytest.raises(RuntimeError, match="must use https:// or loopback"):
+        main._validate_runtime_configuration()
+
+    main.SERVERS[0].gateway_api_url = "https://gateway.internal.example.com:8787"
+    main._validate_runtime_configuration()
 
 
+def test_production_enforces_https_on_credentialed_endpoints() -> None:
+    main.ENVIRONMENT = "production"
+    main.ALLOW_OPEN_REGISTRATION = True
+    main.CONTROL_PLANE_TOKEN = "prod-admin-token"
+    admin_headers = {"Authorization": "Bearer prod-admin-token"}
+
+    # Requests behind a proxy with X-Forwarded-Proto: http are rejected with 400
+    insecure_headers = {**admin_headers, "X-Forwarded-Proto": "http"}
+    assert client.post("/v1/devices", json=registration(), headers=insecure_headers).status_code == 400
+    assert client.post("/v1/servers/reconcile", headers=insecure_headers).status_code == 400
+    assert (
+        client.post(
+            f"/v1/servers/{main.SERVERS[0].id}/reconcile",
+            headers=insecure_headers,
+        ).status_code
+        == 400
+    )
+    assert client.delete("/v1/devices/device-1234", headers=insecure_headers).status_code == 400
+    assert (
+        client.post(
+            "/v1/devices/device-1234/rotate",
+            json={"client_public_key": VALID_PUBLIC_KEY, "app_version": "0.2.0"},
+            headers={"X-Device-Token": "tok", "X-Forwarded-Proto": "http"},
+        ).status_code
+        == 400
+    )
+
+    # Non-loopback plain HTTP URL is rejected with 400
+    public_http_client = TestClient(main.app, base_url="http://cp.example.com")
+    assert public_http_client.post("/v1/devices", json=registration()).status_code == 400
+
+    # HTTPS (direct or via X-Forwarded-Proto: https) is permitted
+    secure_headers = {**admin_headers, "X-Forwarded-Proto": "https"}
+    created = client.post("/v1/devices", json=registration(), headers=secure_headers)
+    assert created.status_code == 200
+    rec = client.post("/v1/servers/reconcile", json={"dry_run": True}, headers=secure_headers)
+    assert rec.status_code == 200

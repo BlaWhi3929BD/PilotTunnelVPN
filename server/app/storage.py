@@ -54,6 +54,15 @@ class DeviceStore:
             }
             if "device_token_hash" not in columns:
                 connection.execute("ALTER TABLE devices ADD COLUMN device_token_hash TEXT")
+        self._restrict_permissions(self.path)
+
+    @staticmethod
+    def _restrict_permissions(target: Path) -> None:
+        try:
+            if target.exists():
+                target.chmod(0o600)
+        except OSError:
+            pass
 
     @staticmethod
     def _row(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -174,9 +183,44 @@ class DeviceStore:
         dest_path = Path(destination).expanduser().resolve()
         dest_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as src_conn:
-            with sqlite3.connect(dest_path, timeout=10.0) as dst_conn:
+            dst_conn = sqlite3.connect(dest_path, timeout=10.0)
+            try:
                 src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+        self._restrict_permissions(dest_path)
         return dest_path
+
+    def restore_from(
+        self,
+        source: str | Path,
+        *,
+        vpn_address_pool: str | None = None,
+        vpn_gateway_address: str | None = None,
+    ) -> list[dict[str, Any]]:
+        src_path = Path(source).expanduser().resolve()
+        if not src_path.exists():
+            raise RuntimeError(f"Backup SQLite file does not exist: {src_path}")
+        try:
+            source_store = DeviceStore(src_path)
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError(f"SQLite database is corrupted or unreadable: {exc}") from exc
+        source_store.verify_integrity(
+            vpn_address_pool=vpn_address_pool,
+            vpn_gateway_address=vpn_gateway_address,
+        )
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with source_store._connect() as src_conn:
+            dst_conn = sqlite3.connect(self.path, timeout=10.0)
+            try:
+                src_conn.backup(dst_conn)
+            finally:
+                dst_conn.close()
+        self._initialize()
+        return self.verify_integrity(
+            vpn_address_pool=vpn_address_pool,
+            vpn_gateway_address=vpn_gateway_address,
+        )
 
     def create(
         self,

@@ -22,6 +22,7 @@ The control plane never receives a client private key and never needs the gatewa
 TUNNELPILOT_ENV=development
 TUNNELPILOT_CONTROL_PLANE_TOKEN=required-for-admin-and-production
 TUNNELPILOT_ALLOW_OPEN_REGISTRATION=false
+TUNNELPILOT_REQUIRE_HTTPS=true
 TUNNELPILOT_GATEWAY_AGENT_URL=http://127.0.0.1:8787
 TUNNELPILOT_GATEWAY_AGENT_TOKEN=long-random-secret
 TUNNELPILOT_DATABASE_PATH=server/data/tunnelpilot.db
@@ -29,7 +30,9 @@ TUNNELPILOT_VPN_ADDRESS_POOL=10.67.0.0/24
 TUNNELPILOT_VPN_GATEWAY_ADDRESS=10.67.0.1
 ```
 
-When `TUNNELPILOT_ENV=production`, startup validation refuses to start if `TUNNELPILOT_CONTROL_PLANE_TOKEN`, `TUNNELPILOT_GATEWAY_AGENT_URL`, `TUNNELPILOT_GATEWAY_AGENT_TOKEN`, or valid non-placeholder server hostnames/public keys are missing.
+When `TUNNELPILOT_ENV=production`, startup validation refuses to start if `TUNNELPILOT_CONTROL_PLANE_TOKEN`, `TUNNELPILOT_GATEWAY_AGENT_URL`, `TUNNELPILOT_GATEWAY_AGENT_TOKEN` (which must be distinct from `TUNNELPILOT_CONTROL_PLANE_TOKEN`), or valid non-placeholder server hostnames/public keys are missing. Remote Gateway Agent URLs in production must use `https://` (plain `http://` is permitted only on loopback `127.0.0.1`/`localhost`/`::1` unless `TUNNELPILOT_ALLOW_INSECURE_GATEWAY_HTTP=true` is explicitly set). Furthermore, credentialed Control Plane endpoints reject plaintext HTTP requests (`X-Forwarded-Proto: http` or non-loopback `http://`) with `400 Bad Request` in production when `TUNNELPILOT_REQUIRE_HTTPS=true`.
+
+`DeviceStore` enforces `0600` file permissions on the SQLite database and provides online `backup_to(destination)` and integrity-verified `restore_from(source)` helpers.
 
 The gateway agent URL can also be set per server with the `gateway_api_url` field in the server catalog.
 

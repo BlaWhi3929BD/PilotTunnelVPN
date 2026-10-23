@@ -82,3 +82,58 @@ def test_device_store_verify_integrity_detects_corrupted_file(tmp_path) -> None:
 
     with pytest.raises(RuntimeError, match="corrupted or unreadable"):
         store.verify_integrity()
+
+
+def test_device_store_backup_and_restore_from_recovers_state_and_rejects_corrupt_backup(tmp_path) -> None:
+    db_path = tmp_path / "primary.db"
+    store = DeviceStore(db_path)
+    store.create(
+        device_id="device-alpha",
+        client_public_key=KEY_ONE,
+        app_version="0.2.0",
+        server_id="dev-1",
+        created_at="2026-10-08T00:00:00+00:00",
+        last_seen_at="2026-10-08T00:00:00+00:00",
+        vpn_address_pool="10.67.0.0/24",
+        vpn_gateway_address="10.67.0.1",
+        device_token_hash="hash-alpha",
+    )
+
+    backup_path = store.backup_to(tmp_path / "backups" / "primary.bak")
+    assert (backup_path.stat().st_mode & 0o777) == 0o600
+
+    # Delete device-alpha and insert device-beta, then restore from backup
+    store.delete("device-alpha")
+    store.create(
+        device_id="device-beta",
+        client_public_key=KEY_TWO,
+        app_version="0.2.0",
+        server_id="dev-1",
+        created_at="2026-10-08T00:01:00+00:00",
+        last_seen_at="2026-10-08T00:01:00+00:00",
+        vpn_address_pool="10.67.0.0/24",
+        vpn_gateway_address="10.67.0.1",
+        device_token_hash="hash-beta",
+    )
+    assert store.get("device-alpha") is None
+
+    restored_rows = store.restore_from(
+        backup_path,
+        vpn_address_pool="10.67.0.0/24",
+        vpn_gateway_address="10.67.0.1",
+    )
+    assert len(restored_rows) == 1
+    assert restored_rows[0]["device_id"] == "device-alpha"
+    assert store.get("device-alpha") is not None
+    assert store.get("device-beta") is None
+
+    # Corrupt backup is rejected before touching the active DB
+    corrupt_backup = tmp_path / "backups" / "corrupt.bak"
+    corrupt_backup.write_bytes(b"corrupted-backup-bytes")
+    with pytest.raises(RuntimeError, match="corrupted or unreadable"):
+        store.restore_from(
+            corrupt_backup,
+            vpn_address_pool="10.67.0.0/24",
+            vpn_gateway_address="10.67.0.1",
+        )
+    assert store.get("device-alpha") is not None

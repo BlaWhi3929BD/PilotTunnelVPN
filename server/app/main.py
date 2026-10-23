@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import Body, FastAPI, Header, HTTPException, Query, Request, status
@@ -35,6 +35,15 @@ ALLOW_OPEN_REGISTRATION = os.getenv("TUNNELPILOT_ALLOW_OPEN_REGISTRATION", "fals
 }
 ALLOW_NONSTANDARD_WG_INTERFACE = os.getenv(
     "TUNNELPILOT_ALLOW_NONSTANDARD_WG_INTERFACE", "false"
+).lower() in {"1", "true", "yes", "on"}
+REQUIRE_HTTPS = os.getenv("TUNNELPILOT_REQUIRE_HTTPS", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+ALLOW_INSECURE_GATEWAY_HTTP = os.getenv(
+    "TUNNELPILOT_ALLOW_INSECURE_GATEWAY_HTTP", "false"
 ).lower() in {"1", "true", "yes", "on"}
 
 
@@ -269,6 +278,30 @@ def _require_registration_auth(authorization: str | None) -> None:
         )
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _enforce_production_transport_security(request: Request) -> None:
+    if ENVIRONMENT != "production" or not REQUIRE_HTTPS:
+        return
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").strip().lower()
+    if forwarded_proto:
+        first_proto = forwarded_proto.split(",")[0].strip()
+        if first_proto != "https":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="HTTPS is required for control plane requests in production",
+            )
+        return
+    scheme = (request.url.scheme or "").lower()
+    hostname = (request.url.hostname or "").lower()
+    if scheme != "https" and hostname not in (_LOOPBACK_HOSTS | {"testserver"}):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="HTTPS is required for control plane requests in production",
+        )
+
+
 def _validate_runtime_configuration() -> None:
     if ENVIRONMENT != "production":
         return
@@ -278,9 +311,25 @@ def _validate_runtime_configuration() -> None:
     if not enabled_servers:
         raise RuntimeError("At least one enabled VPN server is required in production")
     for srv in enabled_servers:
-        if not _gateway_url(srv) or not GATEWAY_AGENT_TOKEN or not GATEWAY_AGENT_TOKEN.strip():
+        gw_url = _gateway_url(srv)
+        if not gw_url or not GATEWAY_AGENT_TOKEN or not GATEWAY_AGENT_TOKEN.strip():
             raise RuntimeError(
                 f"Gateway agent URL and token must be configured for server '{srv.id}' in production"
+            )
+        if CONTROL_PLANE_TOKEN.strip() == GATEWAY_AGENT_TOKEN.strip():
+            raise RuntimeError(
+                "TUNNELPILOT_CONTROL_PLANE_TOKEN and TUNNELPILOT_GATEWAY_AGENT_TOKEN must be distinct in production"
+            )
+        parsed_gw = urlparse(gw_url.strip())
+        gw_scheme = (parsed_gw.scheme or "").lower()
+        gw_host = (parsed_gw.hostname or "").lower()
+        if gw_scheme not in {"http", "https"} or not gw_host:
+            raise RuntimeError(
+                f"Gateway agent URL for server '{srv.id}' is invalid in production"
+            )
+        if gw_scheme == "http" and gw_host not in _LOOPBACK_HOSTS and not ALLOW_INSECURE_GATEWAY_HTTP:
+            raise RuntimeError(
+                f"Gateway agent URL for server '{srv.id}' must use https:// or loopback in production"
             )
         if not srv.hostname.strip() or srv.hostname.strip() == "replace-with-real-gateway":
             raise RuntimeError(
@@ -722,6 +771,7 @@ def reconcile_servers(
     prune_unknown: Annotated[bool | None, Query()] = None,
     confirm_empty_db: Annotated[bool | None, Query()] = None,
 ) -> list[ServerReconcileReport]:
+    _enforce_production_transport_security(request)
     _require_admin_auth(authorization)
     resolved_dry_run, resolved_prune, resolved_confirm = _resolve_reconcile_options(
         request,
@@ -752,6 +802,7 @@ def reconcile_single_server(
     prune_unknown: Annotated[bool | None, Query()] = None,
     confirm_empty_db: Annotated[bool | None, Query()] = None,
 ) -> ServerReconcileReport:
+    _enforce_production_transport_security(request)
     _require_admin_auth(authorization)
     resolved_dry_run, resolved_prune, resolved_confirm = _resolve_reconcile_options(
         request,
@@ -773,10 +824,12 @@ def reconcile_single_server(
 
 @app.post("/v1/devices", response_model=DeviceRegistrationResponse)
 def register_device(
+    request: Request,
     registration: DeviceRegistration,
     authorization: Annotated[str | None, Header()] = None,
     x_device_token: Annotated[str | None, Header()] = None,
 ) -> DeviceRegistrationResponse:
+    _enforce_production_transport_security(request)
     _require_registration_auth(authorization)
 
     existing = _load_record(registration.device_id)
@@ -868,10 +921,12 @@ def register_device(
 
 @app.post("/v1/devices/{device_id}/rotate", response_model=DeviceRotationResponse)
 def rotate_device_key(
+    request: Request,
     device_id: str,
     rotation: DeviceRotationRequest,
     x_device_token: Annotated[str | None, Header()] = None,
 ) -> DeviceRotationResponse:
+    _enforce_production_transport_security(request)
     record = _load_record(device_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -988,11 +1043,13 @@ def _require_revocation_auth(
 
 @app.delete("/v1/devices/{device_id}", response_model=DeviceRevocationResponse)
 def revoke_device(
+    request: Request,
     device_id: str,
     authorization: Annotated[str | None, Header()] = None,
     x_device_token: Annotated[str | None, Header()] = None,
     force: bool = False,
 ) -> DeviceRevocationResponse:
+    _enforce_production_transport_security(request)
     if authorization is None and x_device_token is None:
         if force and not _has_configured_admin_token():
             raise HTTPException(
