@@ -7,6 +7,7 @@ import hmac
 import ipaddress
 import os
 import secrets
+import sqlite3
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -51,7 +52,7 @@ ALLOW_INSECURE_GATEWAY_HTTP = os.getenv(
 async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     _validate_runtime_configuration()
     if RECONCILE_ON_STARTUP:
-        for server in SERVERS:
+        for server in _catalog_servers(include_disabled=False):
             if server.enabled and _gateway_url(server):
                 try:
                     # Startup reconciliation is strictly non-destructive (prune_unknown=False).
@@ -61,7 +62,7 @@ async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-app = FastAPI(title="TunnelPilot Control Plane", version="0.6.0", lifespan=_lifespan)
+app = FastAPI(title="TunnelPilot Control Plane", version="0.7.0", lifespan=_lifespan)
 
 CONTROL_PLANE_TOKEN = os.getenv("TUNNELPILOT_CONTROL_PLANE_TOKEN")
 GATEWAY_AGENT_URL = os.getenv("TUNNELPILOT_GATEWAY_AGENT_URL")
@@ -88,17 +89,84 @@ class Server(BaseModel):
     public_key: str
     port: int = Field(default=51820, ge=1, le=65535)
     enabled: bool = True
+    tier: str = "free"
     gateway_api_url: str | None = Field(default=None, exclude=True)
+    gateway_agent_token: str | None = Field(default=None, exclude=True)
+    vpn_address_pool: str = Field(default="10.67.0.0/24", exclude=True)
+    vpn_gateway_address: str = Field(default="10.67.0.1", exclude=True)
+    configured_peer_capacity: int = Field(default=240, exclude=True)
     health_status: str = "unknown"
     peer_count: int | None = None
     peer_capacity: int | None = None
     capacity_remaining: int | None = None
 
 
+class ServerCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(min_length=2, max_length=64, pattern=r"^[a-zA-Z0-9._-]+$")
+    region: str = Field(min_length=1, max_length=64)
+    hostname: str = Field(min_length=1, max_length=255)
+    public_key: str
+    port: int = Field(default=51820, ge=1, le=65535)
+    enabled: bool = True
+    gateway_api_url: str | None = None
+    gateway_agent_token: str | None = None
+    vpn_address_pool: str = "10.67.0.0/24"
+    vpn_gateway_address: str = "10.67.0.1"
+    peer_capacity: int = Field(default=240, ge=1, le=65534)
+    tier: str = Field(default="free", pattern=r"^(free|premium)$")
+
+    @field_validator("public_key")
+    @classmethod
+    def validate_server_public_key(cls, value: str) -> str:
+        return _validate_public_key(value)
+
+    @field_validator("gateway_api_url")
+    @classmethod
+    def validate_server_gateway_url(cls, value: str | None) -> str | None:
+        return _validate_gateway_api_url(value)
+
+
+class ServerUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    region: str | None = Field(default=None, min_length=1, max_length=64)
+    hostname: str | None = Field(default=None, min_length=1, max_length=255)
+    public_key: str | None = None
+    port: int | None = Field(default=None, ge=1, le=65535)
+    enabled: bool | None = None
+    gateway_api_url: str | None = None
+    gateway_agent_token: str | None = None
+    vpn_address_pool: str | None = None
+    vpn_gateway_address: str | None = None
+    peer_capacity: int | None = Field(default=None, ge=1, le=65534)
+    tier: str | None = Field(default=None, pattern=r"^(free|premium)$")
+
+    @field_validator("public_key")
+    @classmethod
+    def validate_optional_public_key(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _validate_public_key(value)
+
+    @field_validator("gateway_api_url")
+    @classmethod
+    def validate_optional_gateway_url(cls, value: str | None) -> str | None:
+        return _validate_gateway_api_url(value)
+
+
+class ServerDeleteResponse(BaseModel):
+    status: str
+    server_id: str
+
+
 class DeviceRegistration(BaseModel):
     device_id: str = Field(min_length=8, max_length=128)
     client_public_key: str
     app_version: str = Field(min_length=1, max_length=32)
+    server_id: str | None = Field(default=None, min_length=2, max_length=64)
+    region: str | None = Field(default=None, min_length=1, max_length=64)
 
     @field_validator("client_public_key")
     @classmethod
@@ -116,6 +184,7 @@ class DeviceRecord(BaseModel):
     last_seen_at: datetime
     provisioned: bool = False
     device_token_hash: str | None = None
+    tier: str = "free"
 
 
 class DeviceRegistrationResponse(BaseModel):
@@ -126,6 +195,7 @@ class DeviceRegistrationResponse(BaseModel):
     provisioned: bool
     registered_at: datetime
     device_token: str | None = None
+    tier: str = "free"
 
 
 class DeviceRevocationResponse(BaseModel):
@@ -149,6 +219,37 @@ class DeviceRotationResponse(BaseModel):
     client_address: str
     provisioned: bool
     server: Server
+    tier: str = "free"
+
+
+class DeviceMigrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    target_server_id: str = Field(min_length=2, max_length=64)
+    app_version: str | None = Field(default=None, min_length=1, max_length=32)
+
+
+class DeviceMigrationResponse(BaseModel):
+    status: str
+    device_id: str
+    previous_server_id: str
+    client_address: str
+    provisioned: bool
+    server: Server
+    tier: str = "free"
+
+
+class DeviceTierUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    tier: str = Field(pattern=r"^(free|premium)$")
+    purchase_token: str | None = None
+
+
+class DeviceTierUpdateResponse(BaseModel):
+    status: str
+    device_id: str
+    tier: str
 
 
 class ReconcileOptions(BaseModel):
@@ -182,11 +283,22 @@ SERVERS = [
         port=SERVER_PORT,
         enabled=SERVER_ENABLED,
         gateway_api_url=GATEWAY_AGENT_URL,
+        vpn_address_pool=VPN_ADDRESS_POOL,
+        vpn_gateway_address=VPN_GATEWAY_ADDRESS,
     )
 ]
 
 DEVICE_STORE = DeviceStore(DATABASE_PATH)
 DEVICES: dict[str, DeviceRecord] = {}
+
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+_FORBIDDEN_METADATA_HOSTS = {
+    "169.254.169.254",
+    "fd00:ec2::254",
+    "metadata.google.internal",
+    "metadata",
+    "instance-data",
+}
 
 
 def _utc_now() -> datetime:
@@ -197,10 +309,96 @@ def _validate_public_key(value: str) -> str:
     try:
         decoded = base64.b64decode(value, validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise ValueError("client_public_key must be standard base64") from exc
+        raise ValueError("public_key must be standard base64") from exc
     if len(decoded) != 32:
-        raise ValueError("client_public_key must decode to exactly 32 bytes")
+        raise ValueError("public_key must decode to exactly 32 bytes")
     return value
+
+
+def _validate_gateway_api_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return None
+    parsed = urlparse(cleaned)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    if scheme not in {"http", "https"} or not host:
+        raise ValueError("gateway_api_url must be a valid http:// or https:// URL")
+    if parsed.username or parsed.password:
+        raise ValueError("gateway_api_url must not contain embedded user credentials")
+    if host in _FORBIDDEN_METADATA_HOSTS or host.endswith(".internal"):
+        raise ValueError("gateway_api_url cannot target cloud metadata or internal metadata hosts")
+    try:
+        ip_obj = ipaddress.ip_address(host)
+    except ValueError:
+        ip_obj = None
+    if ip_obj is not None:
+        if (
+            ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_unspecified
+            or str(ip_obj) in _FORBIDDEN_METADATA_HOSTS
+        ):
+            raise ValueError("gateway_api_url cannot target link-local, multicast, unspecified, or metadata IPs")
+    if ENVIRONMENT == "production" and scheme == "http" and host not in _LOOPBACK_HOSTS and not ALLOW_INSECURE_GATEWAY_HTTP:
+        raise ValueError("gateway_api_url must use https:// or loopback in production")
+    return cleaned
+
+
+def _server_from_row(row: dict) -> Server:
+    return Server(
+        id=str(row["server_id"]),
+        region=str(row["region"]),
+        hostname=str(row["hostname"]),
+        public_key=str(row["public_key"]),
+        port=int(row["port"]),
+        enabled=bool(row["enabled"]),
+        tier=str(row.get("tier") or "free"),
+        gateway_api_url=row.get("gateway_api_url"),
+        gateway_agent_token=row.get("gateway_agent_token"),
+        vpn_address_pool=str(row.get("vpn_address_pool") or VPN_ADDRESS_POOL),
+        vpn_gateway_address=str(row.get("vpn_gateway_address") or VPN_GATEWAY_ADDRESS),
+        configured_peer_capacity=int(row.get("peer_capacity") or 240),
+    )
+
+
+def _sync_default_server_catalog() -> None:
+    if not SERVERS:
+        return
+    default_srv = SERVERS[0]
+    DEVICE_STORE.ensure_default_server(
+        server_id=default_srv.id,
+        region=default_srv.region,
+        hostname=default_srv.hostname,
+        port=default_srv.port,
+        public_key=default_srv.public_key,
+        enabled=default_srv.enabled,
+        gateway_api_url=default_srv.gateway_api_url or GATEWAY_AGENT_URL,
+        gateway_agent_token=default_srv.gateway_agent_token,
+        vpn_address_pool=VPN_ADDRESS_POOL,
+        vpn_gateway_address=VPN_GATEWAY_ADDRESS,
+        peer_capacity=default_srv.configured_peer_capacity,
+        tier=default_srv.tier,
+    )
+
+
+def _catalog_servers(*, include_disabled: bool = True) -> list[Server]:
+    _sync_default_server_catalog()
+    rows = DEVICE_STORE.list_servers(include_disabled=include_disabled)
+    return [_server_from_row(row) for row in rows]
+
+
+def _get_catalog_server(server_id: str, *, require_enabled: bool = False) -> Server | None:
+    _sync_default_server_catalog()
+    row = DEVICE_STORE.get_server(server_id)
+    if row is None:
+        return None
+    srv = _server_from_row(row)
+    if require_enabled and not srv.enabled:
+        return None
+    return srv
 
 
 def _record_from_row(row: dict) -> DeviceRecord:
@@ -214,6 +412,7 @@ def _record_from_row(row: dict) -> DeviceRecord:
         last_seen_at=datetime.fromisoformat(row["last_seen_at"]),
         provisioned=bool(row["provisioned"]),
         device_token_hash=row.get("device_token_hash"),
+        tier=str(row.get("tier") or "free"),
     )
 
 
@@ -278,9 +477,6 @@ def _require_registration_auth(authorization: str | None) -> None:
         )
 
 
-_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
-
-
 def _enforce_production_transport_security(request: Request) -> None:
     if ENVIRONMENT != "production" or not REQUIRE_HTTPS:
         return
@@ -307,30 +503,26 @@ def _validate_runtime_configuration() -> None:
         return
     if not CONTROL_PLANE_TOKEN or not CONTROL_PLANE_TOKEN.strip():
         raise RuntimeError("TUNNELPILOT_CONTROL_PLANE_TOKEN must be configured in production")
-    enabled_servers = [srv for srv in SERVERS if srv.enabled]
+    enabled_servers = _catalog_servers(include_disabled=False)
     if not enabled_servers:
         raise RuntimeError("At least one enabled VPN server is required in production")
     for srv in enabled_servers:
         gw_url = _gateway_url(srv)
-        if not gw_url or not GATEWAY_AGENT_TOKEN or not GATEWAY_AGENT_TOKEN.strip():
+        gw_token = _gateway_token(srv)
+        if not gw_url or not gw_token or not gw_token.strip():
             raise RuntimeError(
                 f"Gateway agent URL and token must be configured for server '{srv.id}' in production"
             )
-        if CONTROL_PLANE_TOKEN.strip() == GATEWAY_AGENT_TOKEN.strip():
+        if CONTROL_PLANE_TOKEN.strip() == gw_token.strip():
             raise RuntimeError(
                 "TUNNELPILOT_CONTROL_PLANE_TOKEN and TUNNELPILOT_GATEWAY_AGENT_TOKEN must be distinct in production"
             )
-        parsed_gw = urlparse(gw_url.strip())
-        gw_scheme = (parsed_gw.scheme or "").lower()
-        gw_host = (parsed_gw.hostname or "").lower()
-        if gw_scheme not in {"http", "https"} or not gw_host:
+        try:
+            _validate_gateway_api_url(gw_url)
+        except ValueError as exc:
             raise RuntimeError(
-                f"Gateway agent URL for server '{srv.id}' is invalid in production"
-            )
-        if gw_scheme == "http" and gw_host not in _LOOPBACK_HOSTS and not ALLOW_INSECURE_GATEWAY_HTTP:
-            raise RuntimeError(
-                f"Gateway agent URL for server '{srv.id}' must use https:// or loopback in production"
-            )
+                f"Gateway agent URL for server '{srv.id}' is invalid in production: {exc}"
+            ) from exc
         if not srv.hostname.strip() or srv.hostname.strip() == "replace-with-real-gateway":
             raise RuntimeError(
                 f"Server '{srv.id}' has a placeholder or empty hostname in production"
@@ -363,10 +555,15 @@ def _gateway_url(server: Server) -> str | None:
     return server.gateway_api_url or GATEWAY_AGENT_URL
 
 
-def _gateway_headers() -> dict[str, str]:
-    if not GATEWAY_AGENT_TOKEN:
+def _gateway_token(server: Server) -> str | None:
+    return server.gateway_agent_token or GATEWAY_AGENT_TOKEN
+
+
+def _gateway_headers(server: Server) -> dict[str, str]:
+    token = _gateway_token(server)
+    if not token:
         raise HTTPException(status_code=503, detail="Gateway agent token is not configured")
-    return {"Authorization": f"Bearer {GATEWAY_AGENT_TOKEN}"}
+    return {"Authorization": f"Bearer {token}"}
 
 
 def _gateway_request(
@@ -382,20 +579,23 @@ def _gateway_request(
 
     try:
         with httpx.Client(base_url=base_url.rstrip("/"), timeout=5.0) as client:
-            return client.request(method, path, headers=_gateway_headers(), json=json)
+            return client.request(method, path, headers=_gateway_headers(server), json=json)
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail="Gateway agent is unreachable") from exc
 
 
 def _probe_gateway(server: Server) -> dict[str, int | str | bool]:
     base_url = _gateway_url(server)
+    allocated_in_db = DEVICE_STORE.count_devices_for_server(server.id)
+    configured_cap = server.configured_peer_capacity
     if not base_url:
+        remaining_db = max(0, configured_cap - allocated_in_db)
         return {
             "status": "unconfigured",
             "wireguard_available": False,
-            "peer_count": 0,
-            "peer_capacity": 0,
-            "capacity_remaining": 0,
+            "peer_count": allocated_in_db,
+            "peer_capacity": configured_cap,
+            "capacity_remaining": remaining_db,
         }
 
     try:
@@ -405,8 +605,8 @@ def _probe_gateway(server: Server) -> dict[str, int | str | bool]:
         return {
             "status": "unreachable",
             "wireguard_available": False,
-            "peer_count": 0,
-            "peer_capacity": 0,
+            "peer_count": allocated_in_db,
+            "peer_capacity": configured_cap,
             "capacity_remaining": 0,
         }
 
@@ -414,8 +614,8 @@ def _probe_gateway(server: Server) -> dict[str, int | str | bool]:
         return {
             "status": "degraded",
             "wireguard_available": False,
-            "peer_count": 0,
-            "peer_capacity": 0,
+            "peer_count": allocated_in_db,
+            "peer_capacity": configured_cap,
             "capacity_remaining": 0,
         }
 
@@ -425,24 +625,28 @@ def _probe_gateway(server: Server) -> dict[str, int | str | bool]:
         return {
             "status": "degraded",
             "wireguard_available": False,
-            "peer_count": 0,
-            "peer_capacity": 0,
+            "peer_count": allocated_in_db,
+            "peer_capacity": configured_cap,
             "capacity_remaining": 0,
         }
 
-    peer_count = int(payload.get("peer_count", 0))
-    peer_capacity = int(payload.get("peer_capacity", 0))
-    remaining = max(0, int(payload.get("capacity_remaining", peer_capacity - peer_count)))
+    gw_peer_count = int(payload.get("peer_count", 0))
+    gw_peer_capacity = int(payload.get("peer_capacity", configured_cap))
+    effective_capacity = min(configured_cap, gw_peer_capacity) if gw_peer_capacity > 0 else configured_cap
+    effective_count = max(allocated_in_db, gw_peer_count)
+    remaining = max(0, min(int(payload.get("capacity_remaining", effective_capacity - effective_count)), effective_capacity - effective_count))
     wireguard_available = bool(payload.get("wireguard_available", False))
     health_status = str(payload.get("status", "degraded"))
     if not wireguard_available:
         health_status = "degraded"
+    elif remaining == 0 and health_status == "ok":
+        health_status = "full"
 
     return {
         "status": health_status,
         "wireguard_available": wireguard_available,
-        "peer_count": peer_count,
-        "peer_capacity": peer_capacity,
+        "peer_count": effective_count,
+        "peer_capacity": effective_capacity,
         "capacity_remaining": remaining,
     }
 
@@ -459,16 +663,59 @@ def _server_with_health(server: Server) -> Server:
     )
 
 
-def _select_server() -> Server:
-    enabled = [server for server in SERVERS if server.enabled]
-    if not enabled:
+def _select_server(
+    *,
+    preferred_server_id: str | None = None,
+    preferred_region: str | None = None,
+    device_tier: str = "free",
+) -> Server:
+    all_servers = _catalog_servers(include_disabled=True)
+    if preferred_server_id is not None:
+        target = next((s for s in all_servers if s.id == preferred_server_id), None)
+        if target is None:
+            raise HTTPException(status_code=404, detail=f"Requested VPN server '{preferred_server_id}' not found")
+        if not target.enabled:
+            raise HTTPException(status_code=503, detail=f"Requested VPN server '{preferred_server_id}' is disabled")
+        if target.tier == "premium" and device_tier != "premium":
+            raise HTTPException(status_code=403, detail="Premium tier is required for the selected VPN server")
+        checked = _server_with_health(target)
+        if _gateway_url(checked) is not None and (checked.health_status != "ok" or (checked.capacity_remaining or 0) <= 0):
+            raise HTTPException(
+                status_code=503,
+                detail=f"Requested VPN server '{preferred_server_id}' is currently {checked.health_status}",
+            )
+        if (checked.capacity_remaining or 0) <= 0:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Requested VPN server '{preferred_server_id}' has reached its peer capacity",
+            )
+        return checked
+
+    enabled = [server for server in all_servers if server.enabled]
+    if preferred_region is not None:
+        enabled = [s for s in enabled if s.region.lower() == preferred_region.strip().lower()]
+        if not enabled:
+            raise HTTPException(
+                status_code=503,
+                detail=f"No enabled VPN server is available in region '{preferred_region}'",
+            )
+
+    eligible = [
+        s for s in enabled if s.tier == "free" or device_tier == "premium"
+    ]
+    if not eligible:
+        if any(s.tier == "premium" for s in enabled):
+            raise HTTPException(status_code=403, detail="Premium tier is required for available VPN servers")
         raise HTTPException(status_code=503, detail="No VPN server is currently available")
 
     healthy: list[Server] = []
-    for server in enabled:
+    unconfigured_with_cap: list[Server] = []
+    for server in eligible:
         checked = _server_with_health(server)
         if checked.health_status == "ok" and (checked.capacity_remaining or 0) > 0:
             healthy.append(checked)
+        elif _gateway_url(server) is None and (checked.capacity_remaining or 0) > 0:
+            unconfigured_with_cap.append(checked)
 
     if healthy:
         return min(
@@ -476,8 +723,8 @@ def _select_server() -> Server:
             key=lambda server: (-(server.capacity_remaining or 0), server.id),
         )
 
-    if all(_gateway_url(server) is None for server in enabled):
-        return enabled[0]
+    if unconfigured_with_cap and all(_gateway_url(server) is None for server in eligible):
+        return unconfigured_with_cap[0]
 
     raise HTTPException(status_code=503, detail="No healthy VPN server with available capacity is currently available")
 
@@ -613,15 +860,18 @@ def _reconcile_server(
             detail="Gateway agent URL is not configured",
         )
 
+    effective_pool = server.vpn_address_pool or VPN_ADDRESS_POOL
+    effective_gw = server.vpn_gateway_address or VPN_GATEWAY_ADDRESS
     try:
         validated_rows = DEVICE_STORE.verify_integrity(
-            vpn_address_pool=VPN_ADDRESS_POOL,
-            vpn_gateway_address=VPN_GATEWAY_ADDRESS,
+            vpn_address_pool=effective_pool,
+            vpn_gateway_address=effective_gw,
+            server_id=server.id,
         )
-        pool_network = ipaddress.ip_network(VPN_ADDRESS_POOL, strict=True)
+        pool_network = ipaddress.ip_network(effective_pool, strict=True)
         if not isinstance(pool_network, ipaddress.IPv4Network):
             raise RuntimeError("TUNNELPILOT_VPN_ADDRESS_POOL must be an IPv4 network")
-    except (RuntimeError, ValueError) as exc:
+    except (RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
         raise HTTPException(
             status_code=503,
             detail=f"Refusing gateway reconciliation due to database or pool state error: {exc}",
@@ -647,9 +897,16 @@ def _reconcile_server(
         elif public_key in peer_allowed_ips and peer_allowed_ips[public_key] != [client_address]:
             to_restore.append((public_key, client_address))
 
+    tombstone_keys = {
+        str(row["client_public_key"])
+        for row in DEVICE_STORE.list_tombstones(server.id)
+        if str(row["client_public_key"]) not in expected_map
+    }
+    tombstones_to_remove = sorted(active_peers & tombstone_keys)
+
     prunable_unknown: list[str] = []
     unmanaged_unknown: list[str] = []
-    for unknown_key in sorted(active_peers - expected_map.keys()):
+    for unknown_key in sorted(active_peers - expected_map.keys() - tombstone_keys):
         allowed_for_peer = peer_allowed_ips.get(unknown_key) if peer_allowed_ips else None
         if _is_managed_pool_peer(allowed_for_peer, pool_network):
             prunable_unknown.append(unknown_key)
@@ -666,6 +923,7 @@ def _reconcile_server(
         )
 
     if dry_run:
+        would_remove = len(tombstones_to_remove) + (len(prunable_unknown) if prune_unknown else 0)
         return ServerReconcileReport(
             server_id=server.id,
             status="dry_run",
@@ -674,7 +932,7 @@ def _reconcile_server(
             restored_peers=0,
             removed_peers=0,
             would_restore_peers=len(to_restore),
-            would_remove_peers=len(prunable_unknown) if prune_unknown else 0,
+            would_remove_peers=would_remove,
             unknown_peers=len(prunable_unknown),
             unmanaged_peers=len(unmanaged_unknown),
         )
@@ -682,9 +940,17 @@ def _reconcile_server(
     restored = 0
     for public_key, client_address in to_restore:
         _provision_peer(server, public_key, client_address)
+        DEVICE_STORE.remove_tombstone(server.id, public_key)
         restored += 1
 
     removed = 0
+    for tomb_key in tombstones_to_remove:
+        _revoke_peer(server, tomb_key)
+        DEVICE_STORE.remove_tombstone(server.id, tomb_key)
+        removed += 1
+    for cleared_tomb in tombstone_keys - active_peers:
+        DEVICE_STORE.remove_tombstone(server.id, cleared_tomb)
+
     if prune_unknown:
         for stale_key in prunable_unknown:
             _revoke_peer(server, stale_key)
@@ -710,17 +976,124 @@ def healthz() -> dict[str, str]:
 
 
 @app.get("/v1/servers", response_model=list[Server])
-def list_servers() -> list[Server]:
-    enabled = [server for server in SERVERS if server.enabled]
-    healthy = [_server_with_health(server) for server in enabled]
+def list_servers(
+    request: Request,
+    include_disabled: bool = False,
+    region: str | None = None,
+    authorization: Annotated[str | None, Header()] = None,
+) -> list[Server]:
+    if include_disabled:
+        _enforce_production_transport_security(request)
+        _require_admin_auth(authorization)
+    servers = _catalog_servers(include_disabled=include_disabled)
+    if region is not None:
+        servers = [s for s in servers if s.region.lower() == region.strip().lower()]
+    healthy = [_server_with_health(server) for server in servers]
     return sorted(
         healthy,
         key=lambda server: (
+            not server.enabled,
             server.health_status not in {"ok", "full"},
             -(server.capacity_remaining or 0),
             server.id,
         ),
     )
+
+
+@app.post("/v1/servers", response_model=Server, status_code=status.HTTP_201_CREATED)
+def create_server_endpoint(
+    request: Request,
+    payload: ServerCreateRequest,
+    authorization: Annotated[str | None, Header()] = None,
+) -> Server:
+    _enforce_production_transport_security(request)
+    _require_admin_auth(authorization)
+    _sync_default_server_catalog()
+    try:
+        row = DEVICE_STORE.create_server(
+            server_id=payload.id,
+            region=payload.region,
+            hostname=payload.hostname,
+            port=payload.port,
+            public_key=payload.public_key,
+            enabled=payload.enabled,
+            gateway_api_url=payload.gateway_api_url,
+            gateway_agent_token=payload.gateway_agent_token,
+            vpn_address_pool=payload.vpn_address_pool,
+            vpn_gateway_address=payload.vpn_gateway_address,
+            peer_capacity=payload.peer_capacity,
+            tier=payload.tier,
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        if "already exists" in msg:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=msg) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg) from exc
+    srv = _server_from_row(row)
+    return _server_with_health(srv)
+
+
+@app.patch("/v1/servers/{server_id}", response_model=Server)
+@app.put("/v1/servers/{server_id}", response_model=Server)
+def update_server_endpoint(
+    server_id: str,
+    request: Request,
+    payload: ServerUpdateRequest,
+    authorization: Annotated[str | None, Header()] = None,
+) -> Server:
+    _enforce_production_transport_security(request)
+    _require_admin_auth(authorization)
+    _sync_default_server_catalog()
+    fields_set = payload.model_fields_set
+    try:
+        row = DEVICE_STORE.update_server(
+            server_id,
+            region=payload.region,
+            hostname=payload.hostname,
+            port=payload.port,
+            public_key=payload.public_key,
+            enabled=payload.enabled,
+            gateway_api_url=payload.gateway_api_url,
+            update_gateway_api_url="gateway_api_url" in fields_set,
+            gateway_agent_token=payload.gateway_agent_token,
+            update_gateway_agent_token="gateway_agent_token" in fields_set,
+            vpn_address_pool=payload.vpn_address_pool,
+            vpn_gateway_address=payload.vpn_gateway_address,
+            peer_capacity=payload.peer_capacity,
+            tier=payload.tier,
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Server not found") from exc
+    except ValueError as exc:
+        msg = str(exc)
+        if "incompatible" in msg or "Cannot reduce" in msg:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=msg) from exc
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg) from exc
+
+    updated_srv = _server_from_row(row)
+    for idx, mem_srv in enumerate(SERVERS):
+        if mem_srv.id == server_id:
+            SERVERS[idx] = updated_srv
+    return _server_with_health(updated_srv)
+
+
+@app.delete("/v1/servers/{server_id}", response_model=ServerDeleteResponse)
+def delete_server_endpoint(
+    server_id: str,
+    request: Request,
+    authorization: Annotated[str | None, Header()] = None,
+) -> ServerDeleteResponse:
+    _enforce_production_transport_security(request)
+    _require_admin_auth(authorization)
+    _sync_default_server_catalog()
+    try:
+        DEVICE_STORE.delete_server(server_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Server not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    SERVERS[:] = [s for s in SERVERS if s.id != server_id]
+    return ServerDeleteResponse(status="deleted", server_id=server_id)
 
 
 _ALLOWED_RECONCILE_QUERY_PARAMS = {"dry_run", "prune_unknown", "confirm_empty_db"}
@@ -780,16 +1153,40 @@ def reconcile_servers(
         prune_unknown,
         confirm_empty_db,
     )
-    enabled = [server for server in SERVERS if server.enabled]
-    return [
-        _reconcile_server(
-            server,
-            dry_run=resolved_dry_run,
-            prune_unknown=resolved_prune,
-            confirm_empty_db=resolved_confirm,
-        )
-        for server in enabled
-    ]
+    try:
+        enabled = _catalog_servers(include_disabled=False)
+    except (RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Refusing gateway reconciliation due to database or pool state error: {exc}",
+        ) from exc
+    reports: list[ServerReconcileReport] = []
+    for idx, server in enumerate(enabled):
+        try:
+            reports.append(
+                _reconcile_server(
+                    server,
+                    dry_run=resolved_dry_run,
+                    prune_unknown=resolved_prune,
+                    confirm_empty_db=resolved_confirm,
+                )
+            )
+        except HTTPException as exc:
+            # If multiple servers are configured and one gateway is unreachable (502),
+            # isolate the gateway failure in the batch report instead of aborting healthy servers.
+            if len(enabled) > 1 and exc.status_code == 502:
+                reports.append(
+                    ServerReconcileReport(
+                        server_id=server.id,
+                        status="error",
+                        dry_run=resolved_dry_run,
+                        prune_unknown=resolved_prune,
+                        detail=str(exc.detail),
+                    )
+                )
+            else:
+                raise
+    return reports
 
 
 @app.post("/v1/servers/{server_id}/reconcile", response_model=ServerReconcileReport)
@@ -811,7 +1208,13 @@ def reconcile_single_server(
         prune_unknown,
         confirm_empty_db,
     )
-    server = next((item for item in SERVERS if item.id == server_id and item.enabled), None)
+    try:
+        server = _get_catalog_server(server_id, require_enabled=True)
+    except (RuntimeError, ValueError, sqlite3.DatabaseError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Refusing gateway reconciliation due to database or pool state error: {exc}",
+        ) from exc
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")
     return _reconcile_server(
@@ -842,7 +1245,15 @@ def register_device(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="device_id is already registered with a different public key",
             )
-        server = next((item for item in SERVERS if item.id == existing.server_id and item.enabled), None)
+        if registration.server_id is not None and registration.server_id != existing.server_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Device is pinned to server '{existing.server_id}'; "
+                    "use POST /v1/devices/{device_id}/migrate to switch servers"
+                ),
+            )
+        server = _get_catalog_server(existing.server_id, require_enabled=True)
         if server is None:
             raise HTTPException(status_code=503, detail="Assigned VPN server is unavailable")
         client_address = existing.client_address
@@ -854,7 +1265,11 @@ def register_device(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="client_public_key is already registered to another device_id",
             )
-        server = _select_server()
+        server = _select_server(
+            preferred_server_id=registration.server_id,
+            preferred_region=registration.region,
+            device_tier="free",
+        )
         issued_token, token_hash = _issue_device_token()
         now = _utc_now()
         try:
@@ -865,9 +1280,11 @@ def register_device(
                 server_id=server.id,
                 created_at=now.isoformat(),
                 last_seen_at=now.isoformat(),
-                vpn_address_pool=VPN_ADDRESS_POOL,
-                vpn_gateway_address=VPN_GATEWAY_ADDRESS,
+                vpn_address_pool=server.vpn_address_pool,
+                vpn_gateway_address=server.vpn_gateway_address,
                 device_token_hash=token_hash,
+                peer_capacity=server.configured_peer_capacity,
+                tier="free",
             )
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
@@ -881,6 +1298,7 @@ def register_device(
         # wg set is idempotent and repairs the peer if the gateway lost it.
         if _gateway_url(server):
             _provision_peer(server, registration.client_public_key, client_address)
+            DEVICE_STORE.remove_tombstone(server.id, registration.client_public_key)
             provisioned = True
         else:
             provisioned = existing.provisioned
@@ -916,6 +1334,7 @@ def register_device(
         provisioned=record.provisioned,
         registered_at=created_at,
         device_token=issued_token,
+        tier=record.tier,
     )
 
 
@@ -934,7 +1353,7 @@ def rotate_device_key(
     _require_device_auth(record, x_device_token)
 
     if rotation.client_public_key == record.client_public_key:
-        server = next((item for item in SERVERS if item.id == record.server_id and item.enabled), None)
+        server = _get_catalog_server(record.server_id, require_enabled=True)
         if server is None:
             raise HTTPException(status_code=503, detail="Assigned VPN server is unavailable")
         if _gateway_url(server):
@@ -961,7 +1380,7 @@ def rotate_device_key(
             detail="client_public_key is already registered to another device_id",
         )
 
-    server = next((item for item in SERVERS if item.id == record.server_id and item.enabled), None)
+    server = _get_catalog_server(record.server_id, require_enabled=True)
     if server is None:
         raise HTTPException(status_code=503, detail="Assigned VPN server is unavailable")
     if not _gateway_url(server):
@@ -1004,6 +1423,167 @@ def rotate_device_key(
         provisioned=updated.provisioned,
         server=server,
     )
+
+
+@app.post("/v1/devices/{device_id}/migrate", response_model=DeviceMigrationResponse)
+def migrate_device_server(
+    request: Request,
+    device_id: str,
+    migration: DeviceMigrationRequest,
+    authorization: Annotated[str | None, Header()] = None,
+    x_device_token: Annotated[str | None, Header()] = None,
+) -> DeviceMigrationResponse:
+    _enforce_production_transport_security(request)
+    record = _load_record(device_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    is_admin = False
+    if authorization is not None:
+        _require_admin_auth(authorization)
+        is_admin = True
+    else:
+        _require_device_auth(record, x_device_token)
+
+    target_server = _get_catalog_server(migration.target_server_id, require_enabled=False)
+    if target_server is None:
+        raise HTTPException(status_code=404, detail="Target VPN server not found")
+    if not target_server.enabled:
+        raise HTTPException(status_code=503, detail="Target VPN server is disabled")
+    if target_server.tier == "premium" and record.tier != "premium" and not is_admin:
+        raise HTTPException(status_code=403, detail="Premium tier is required for the target VPN server")
+
+    previous_server_id = record.server_id
+    if target_server.id == previous_server_id:
+        if _gateway_url(target_server):
+            _provision_peer(target_server, record.client_public_key, record.client_address)
+            if not record.provisioned:
+                DEVICE_STORE.update(
+                    device_id=device_id,
+                    last_seen_at=_utc_now().isoformat(),
+                    provisioned=True,
+                )
+                record = _load_record(device_id) or record
+        return DeviceMigrationResponse(
+            status="unchanged",
+            device_id=record.device_id,
+            previous_server_id=previous_server_id,
+            client_address=record.client_address,
+            provisioned=record.provisioned,
+            server=_server_with_health(target_server),
+        )
+
+    checked_target = _server_with_health(target_server)
+    if _gateway_url(checked_target) is not None and checked_target.health_status != "ok":
+        raise HTTPException(
+            status_code=503,
+            detail=f"Target VPN server '{target_server.id}' is currently {checked_target.health_status}",
+        )
+    if (checked_target.capacity_remaining or 0) <= 0:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Target VPN server '{target_server.id}' has reached its peer capacity",
+        )
+
+    try:
+        new_client_address = DEVICE_STORE.allocate_address_for_server(
+            server_id=target_server.id,
+            vpn_address_pool=target_server.vpn_address_pool,
+            vpn_gateway_address=target_server.vpn_gateway_address,
+            peer_capacity=target_server.configured_peer_capacity,
+            exclude_device_id=device_id,
+        )
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+
+    target_provisioned = False
+    if _gateway_url(target_server):
+        _provision_peer(target_server, record.client_public_key, new_client_address)
+        DEVICE_STORE.remove_tombstone(target_server.id, record.client_public_key)
+        target_provisioned = True
+
+    old_server = _get_catalog_server(previous_server_id, require_enabled=False)
+    old_client_address = record.client_address
+    try:
+        DEVICE_STORE.update(
+            device_id=device_id,
+            server_id=target_server.id,
+            client_address=new_client_address,
+            app_version=migration.app_version or record.app_version,
+            last_seen_at=_utc_now().isoformat(),
+            provisioned=target_provisioned,
+        )
+    except Exception as exc:
+        if target_provisioned and _gateway_url(target_server):
+            try:
+                _revoke_peer(target_server, record.client_public_key)
+            except Exception:
+                DEVICE_STORE.add_tombstone(target_server.id, record.client_public_key, new_client_address)
+        if isinstance(exc, ValueError):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        raise HTTPException(status_code=503, detail="Failed to persist server migration") from exc
+
+    if old_server is not None and record.provisioned and _gateway_url(old_server):
+        try:
+            _revoke_peer(old_server, record.client_public_key)
+        except Exception:
+            # Record a durable tombstone so the source gateway cleans up the migrated peer on next reconciliation.
+            DEVICE_STORE.add_tombstone(old_server.id, record.client_public_key, old_client_address)
+
+    updated = _load_record(device_id)
+    if updated is None:
+        raise HTTPException(status_code=500, detail="Device state could not be loaded after migration")
+
+    return DeviceMigrationResponse(
+        status="migrated",
+        device_id=updated.device_id,
+        previous_server_id=previous_server_id,
+        client_address=updated.client_address,
+        provisioned=updated.provisioned,
+        server=_server_with_health(target_server),
+        tier=updated.tier,
+    )
+
+
+@app.post("/v1/devices/{device_id}/tier", response_model=DeviceTierUpdateResponse)
+def update_device_tier(
+    request: Request,
+    device_id: str,
+    payload: DeviceTierUpdateRequest,
+    authorization: Annotated[str | None, Header()] = None,
+    x_device_token: Annotated[str | None, Header()] = None,
+) -> DeviceTierUpdateResponse:
+    _enforce_production_transport_security(request)
+    record = _load_record(device_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    if authorization is not None:
+        _require_admin_auth(authorization)
+    else:
+        _require_device_auth(record, x_device_token)
+        if payload.tier == "premium":
+            expected_receipt_secret = os.getenv("TUNNELPILOT_BILLING_VERIFY_SECRET")
+            if ENVIRONMENT == "production" and not expected_receipt_secret:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Play Billing verification is not configured on control plane",
+                )
+            if expected_receipt_secret:
+                if not payload.purchase_token or not hmac.compare_digest(
+                    payload.purchase_token, expected_receipt_secret
+                ):
+                    raise HTTPException(status_code=403, detail="Invalid or unverified purchase token")
+            elif not payload.purchase_token or len(payload.purchase_token.strip()) < 8:
+                raise HTTPException(status_code=403, detail="Valid purchase_token is required for premium upgrade")
+
+    DEVICE_STORE.update(
+        device_id=device_id,
+        tier=payload.tier,
+        last_seen_at=_utc_now().isoformat(),
+    )
+    updated = _load_record(device_id) or record
+    return DeviceTierUpdateResponse(status="updated", device_id=updated.device_id, tier=updated.tier)
 
 
 def _require_revocation_auth(
@@ -1069,19 +1649,21 @@ def revoke_device(
 
     _require_revocation_auth(record, authorization, x_device_token, force=force)
 
-    server = next((item for item in SERVERS if item.id == record.server_id), None)
+    server = _get_catalog_server(record.server_id, require_enabled=False)
     if server is None and not force:
         raise HTTPException(status_code=503, detail="Assigned VPN server is unavailable")
 
     if record.provisioned and server and _gateway_url(server):
         try:
             _revoke_peer(server, record.client_public_key)
+            DEVICE_STORE.remove_tombstone(server.id, record.client_public_key)
         except Exception as exc:
             if not force:
                 raise HTTPException(
                     status_code=502,
                     detail="Gateway peer removal failed. Use force=true to override.",
                 ) from exc
+            DEVICE_STORE.add_tombstone(server.id, record.client_public_key, record.client_address)
 
     DEVICE_STORE.delete(device_id)
     DEVICES.pop(device_id, None)

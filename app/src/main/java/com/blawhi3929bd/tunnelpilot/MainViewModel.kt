@@ -18,6 +18,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val routingMode: StateFlow<RoutingMode> = controller.routingMode
     val reconnectRequired: StateFlow<Boolean> = controller.reconnectRequired
     val controlPlaneUrl: StateFlow<String> = controller.controlPlaneUrl
+    val preferredServerId: StateFlow<String?> = controller.preferredServerId
+    val preferredRegion: StateFlow<String?> = controller.preferredRegion
+    val assignedServerId: StateFlow<String?> = controller.assignedServerId
+    val deviceTier: StateFlow<String> = controller.deviceTier
+    val adsConsent: StateFlow<Boolean> = controller.adsConsent
     val provisioningState: StateFlow<ProvisioningState> = controller.provisioningState
     val servers: StateFlow<List<RegisteredServer>> = controller.servers
     val serversLoaded: StateFlow<Boolean> = controller.serversLoaded
@@ -36,13 +41,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun toggleApp(packageName: String) = controller.toggleApp(packageName)
 
+    fun setSelectedApps(packages: Set<String>) = controller.setSelectedApps(packages)
+
     fun clearSelectedApps() = controller.clearSelectedApps()
 
     fun setControlPlaneUrl(url: String) = controller.setControlPlaneUrl(url)
 
+    fun setPreferredServerId(serverId: String?) = controller.setPreferredServerId(serverId)
+
+    fun setPreferredRegion(region: String?) = controller.setPreferredRegion(region)
+
+    fun setAdsConsent(consented: Boolean) = controller.setAdsConsent(consented)
+
     fun provision() = controller.provision()
 
     fun rotateDeviceKey() = controller.rotateDeviceKey()
+
+    fun migrateServer(targetServerId: String) = controller.migrateServer(targetServerId)
+
+    fun upgradeTier(tier: String, purchaseToken: String? = null) = controller.upgradeTier(tier, purchaseToken)
 
     fun refreshServers() = controller.refreshServers()
 

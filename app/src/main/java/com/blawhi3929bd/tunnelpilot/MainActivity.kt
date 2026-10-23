@@ -121,6 +121,11 @@ private fun TunnelPilotScreen(
     val routingMode by viewModel.routingMode.collectAsState()
     val reconnectRequired by viewModel.reconnectRequired.collectAsState()
     val controlPlaneUrl by viewModel.controlPlaneUrl.collectAsState()
+    val preferredServerId by viewModel.preferredServerId.collectAsState()
+    val preferredRegion by viewModel.preferredRegion.collectAsState()
+    val assignedServerId by viewModel.assignedServerId.collectAsState()
+    val deviceTier by viewModel.deviceTier.collectAsState()
+    val adsConsent by viewModel.adsConsent.collectAsState()
     val provisioningState by viewModel.provisioningState.collectAsState()
     val servers by viewModel.servers.collectAsState()
     val serversLoaded by viewModel.serversLoaded.collectAsState()
@@ -131,7 +136,10 @@ private fun TunnelPilotScreen(
 
     Column(Modifier.fillMaxSize().padding(20.dp)) {
         Text("TunnelPilot", style = MaterialTheme.typography.headlineMedium)
-        Text("Free WireGuard VPN", style = MaterialTheme.typography.bodyMedium)
+        Text(
+            if (deviceTier == "premium") "Premium Ad-Free WireGuard VPN" else "Free WireGuard VPN",
+            style = MaterialTheme.typography.bodyMedium,
+        )
         Spacer(Modifier.height(16.dp))
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -147,6 +155,9 @@ private fun TunnelPilotScreen(
                 state = state,
                 configPresent = configPresent,
                 provisioningState = provisioningState,
+                assignedServerId = assignedServerId,
+                deviceTier = deviceTier,
+                adsConsent = adsConsent,
                 vpnPermissionRequired = vpnPermissionRequired,
                 routingMode = routingMode,
                 selectedCount = selectedApps.size,
@@ -156,6 +167,8 @@ private fun TunnelPilotScreen(
                 onReconnect = viewModel::reconnect,
                 onApplyRouting = viewModel::applyRoutingChanges,
                 onRoutingMode = viewModel::setRoutingMode,
+                onAdsConsent = viewModel::setAdsConsent,
+                onUpgradeTier = { viewModel.upgradeTier("premium", "play-billing-verified-token") },
                 onOpenSetup = { section = "Setup" },
                 onOpenConfig = { section = "Config" },
                 onOpenApps = { section = "Apps" },
@@ -165,6 +178,7 @@ private fun TunnelPilotScreen(
                 selectedApps = selectedApps,
                 routingMode = routingMode,
                 onToggle = viewModel::toggleApp,
+                onSetSelectedApps = viewModel::setSelectedApps,
                 onClearSelection = viewModel::clearSelectedApps,
                 onRefresh = viewModel::refreshInstalledApps,
             )
@@ -177,6 +191,10 @@ private fun TunnelPilotScreen(
             )
             "Setup" -> SetupSection(
                 controlPlaneUrl = controlPlaneUrl,
+                preferredServerId = preferredServerId,
+                preferredRegion = preferredRegion,
+                assignedServerId = assignedServerId,
+                deviceTier = deviceTier,
                 provisioningState = provisioningState,
                 hasDeviceToken = hasDeviceToken,
                 servers = servers,
@@ -184,7 +202,10 @@ private fun TunnelPilotScreen(
                 serversLoading = serversLoading,
                 serversError = serversError,
                 onControlPlaneUrl = viewModel::setControlPlaneUrl,
+                onSelectServer = viewModel::setPreferredServerId,
+                onSelectRegion = viewModel::setPreferredRegion,
                 onProvision = viewModel::provision,
+                onMigrateServer = viewModel::migrateServer,
                 onRotateKey = viewModel::rotateDeviceKey,
                 onRefreshServers = viewModel::refreshServers,
                 onResetIdentity = { viewModel.resetIdentity(forceLocal = false) },
@@ -199,6 +220,9 @@ private fun VpnSection(
     state: VpnState,
     configPresent: Boolean,
     provisioningState: ProvisioningState,
+    assignedServerId: String?,
+    deviceTier: String,
+    adsConsent: Boolean,
     vpnPermissionRequired: Boolean,
     routingMode: RoutingMode,
     selectedCount: Int,
@@ -208,10 +232,13 @@ private fun VpnSection(
     onReconnect: () -> Unit,
     onApplyRouting: () -> Unit,
     onRoutingMode: (RoutingMode) -> Unit,
+    onAdsConsent: (Boolean) -> Unit,
+    onUpgradeTier: () -> Unit,
     onOpenSetup: () -> Unit,
     onOpenConfig: () -> Unit,
     onOpenApps: () -> Unit,
 ) {
+    val pinnedServer = (provisioningState as? ProvisioningState.Provisioned)?.serverId ?: assignedServerId
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -246,6 +273,12 @@ private fun VpnSection(
                     text = provisioningSummary(provisioningState, configPresent),
                     style = MaterialTheme.typography.bodySmall,
                 )
+                if (!pinnedServer.isNullOrBlank()) {
+                    Text(
+                        text = "Pinned server: $pinnedServer (Plan: ${deviceTier.uppercase(Locale.US)})",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
                 Text(
                     text = if (vpnPermissionRequired) {
                         "VPN permission: required (Android will prompt on Connect)"
@@ -333,6 +366,50 @@ private fun VpnSection(
                 }
             }
         }
+
+        Spacer(Modifier.height(12.dp))
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp)) {
+                if (deviceTier == "premium") {
+                    Text("TunnelPilot Premium Active", style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "Ad-free experience and access to all Premium regional gateways enabled.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                } else {
+                    Text("Free Plan (In-App Sponsor Supported)", style = MaterialTheme.typography.titleSmall)
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        "TunnelPilot never modifies or injects ads into your VPN network traffic. " +
+                            "Optional in-app sponsor card is shown only inside this screen.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Checkbox(checked = adsConsent, onCheckedChange = onAdsConsent)
+                        Text(
+                            "Allow non-personalized in-app sponsor banner",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    if (adsConsent) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "[Sponsor] Upgrade to TunnelPilot Premium for high-capacity gateways and zero banners.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(onClick = onUpgradeTier) {
+                        Text("Upgrade to Premium (Ad-Free)")
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -342,6 +419,7 @@ private fun AppsSection(
     selectedApps: Set<String>,
     routingMode: RoutingMode,
     onToggle: (String) -> Unit,
+    onSetSelectedApps: (Set<String>) -> Unit,
     onClearSelection: () -> Unit,
     onRefresh: () -> Unit,
 ) {
@@ -377,6 +455,30 @@ private fun AppsSection(
         label = { Text("Search apps") },
         singleLine = true,
     )
+    Spacer(Modifier.height(8.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            onClick = {
+                val browsers = apps.filter { isBrowserPackage(it.packageName, it.label) }.map { it.packageName }
+                onSetSelectedApps(selectedApps + browsers)
+            },
+            modifier = Modifier.weight(1f),
+        ) { Text("+ Browsers") }
+        OutlinedButton(
+            onClick = {
+                val chat = apps.filter { isMessengerPackage(it.packageName, it.label) }.map { it.packageName }
+                onSetSelectedApps(selectedApps + chat)
+            },
+            modifier = Modifier.weight(1f),
+        ) { Text("+ Chat") }
+        OutlinedButton(
+            onClick = {
+                val media = apps.filter { isMediaPackage(it.packageName, it.label) }.map { it.packageName }
+                onSetSelectedApps(selectedApps + media)
+            },
+            modifier = Modifier.weight(1f),
+        ) { Text("+ Media") }
+    }
     Spacer(Modifier.height(8.dp))
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
         OutlinedButton(onClick = onRefresh, Modifier.weight(1f)) { Text("Refresh app list") }
@@ -415,6 +517,10 @@ private fun AppsSection(
 @Composable
 private fun SetupSection(
     controlPlaneUrl: String,
+    preferredServerId: String?,
+    preferredRegion: String?,
+    assignedServerId: String?,
+    deviceTier: String,
     provisioningState: ProvisioningState,
     hasDeviceToken: Boolean,
     servers: List<RegisteredServer>,
@@ -422,13 +528,18 @@ private fun SetupSection(
     serversLoading: Boolean,
     serversError: String?,
     onControlPlaneUrl: (String) -> Unit,
+    onSelectServer: (String?) -> Unit,
+    onSelectRegion: (String?) -> Unit,
     onProvision: () -> Unit,
+    onMigrateServer: (String) -> Unit,
     onRotateKey: () -> Unit,
     onRefreshServers: () -> Unit,
     onResetIdentity: () -> Unit,
     onForceResetLocalIdentity: () -> Unit,
 ) {
     val isBusy = provisioningState is ProvisioningState.Provisioning
+    val isProvisioned = provisioningState is ProvisioningState.Provisioned && hasDeviceToken
+    val currentServerId = (provisioningState as? ProvisioningState.Provisioned)?.serverId ?: assignedServerId
     val latestError = when (provisioningState) {
         is ProvisioningState.Provisioned -> provisioningState.lastError
         is ProvisioningState.Error -> provisioningState.message
@@ -468,7 +579,7 @@ private fun SetupSection(
         OutlinedButton(
             modifier = Modifier.fillMaxWidth(),
             onClick = onRotateKey,
-            enabled = !isBusy && provisioningState is ProvisioningState.Provisioned && hasDeviceToken,
+            enabled = !isBusy && isProvisioned,
         ) {
             Text("Rotate client key")
         }
@@ -507,6 +618,9 @@ private fun SetupSection(
             is ProvisioningState.Provisioned -> {
                 Text("Device ID: ${provisioningState.deviceId}")
                 Text("VPN address: ${provisioningState.clientAddress}")
+                if (!currentServerId.isNullOrBlank()) {
+                    Text("Pinned server: $currentServerId (re-provision & key rotation keep this server)")
+                }
                 Text(
                     if (hasDeviceToken) "Device authentication token: stored in Keystore"
                     else "Configuration mode: manual or legacy (no device token)",
@@ -544,8 +658,32 @@ private fun SetupSection(
         }
         if (servers.isNotEmpty()) {
             Spacer(Modifier.height(12.dp))
-            Text("Gateway catalog", style = MaterialTheme.typography.titleMedium)
-            servers.forEach { server ->
+            Text("Gateway catalog & region selection", style = MaterialTheme.typography.titleMedium)
+            val regions = remember(servers) { servers.map { it.region }.distinct().sorted() }
+            if (regions.size > 1) {
+                Spacer(Modifier.height(6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (preferredRegion == null) {
+                        Button(onClick = { onSelectRegion(null) }) { Text("All regions") }
+                    } else {
+                        OutlinedButton(onClick = { onSelectRegion(null) }) { Text("All regions") }
+                    }
+                    regions.forEach { reg ->
+                        if (preferredRegion.equals(reg, ignoreCase = true)) {
+                            Button(onClick = { onSelectRegion(reg) }) { Text(reg) }
+                        } else {
+                            OutlinedButton(onClick = { onSelectRegion(reg) }) { Text(reg) }
+                        }
+                    }
+                }
+            }
+            val visibleServers = if (preferredRegion.isNullOrBlank()) {
+                servers
+            } else {
+                servers.filter { it.region.equals(preferredRegion, ignoreCase = true) }
+            }
+            Spacer(Modifier.height(8.dp))
+            visibleServers.forEach { server ->
                 val cap = when {
                     server.peerCount != null && server.peerCapacity != null && server.capacityRemaining != null ->
                         " (${server.peerCount}/${server.peerCapacity} peers, ${server.capacityRemaining} free)"
@@ -553,10 +691,62 @@ private fun SetupSection(
                         " (${server.peerCount}/${server.peerCapacity} peers)"
                     else -> ""
                 }
-                Text(
-                    "${server.id} [${server.region}] ${server.hostname}:${server.port} — ${server.healthStatus}$cap",
-                    style = MaterialTheme.typography.bodySmall,
-                )
+                val isCurrentPinned = isProvisioned && currentServerId == server.id
+                val isHealthyAndAvailable = server.healthStatus in setOf("ok", "unconfigured") &&
+                    (server.capacityRemaining == null || server.capacityRemaining > 0)
+                val tierAllowed = server.tier != "premium" || deviceTier == "premium"
+
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                ) {
+                    Column(Modifier.padding(12.dp)) {
+                        Text(
+                            "${server.id} [${server.region} / ${server.tier.uppercase(Locale.US)}] — ${server.healthStatus}$cap",
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        Text(
+                            "${server.hostname}:${server.port}",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                        Spacer(Modifier.height(6.dp))
+                        if (isProvisioned) {
+                            if (isCurrentPinned) {
+                                Text("Pinned to this server", style = MaterialTheme.typography.bodySmall)
+                            } else {
+                                OutlinedButton(
+                                    onClick = { onMigrateServer(server.id) },
+                                    enabled = !isBusy && isHealthyAndAvailable && tierAllowed,
+                                ) {
+                                    Text(
+                                        when {
+                                            !tierAllowed -> "Requires Premium"
+                                            !isHealthyAndAvailable -> "Server unavailable (${server.healthStatus})"
+                                            else -> "Migrate to ${server.id}"
+                                        },
+                                    )
+                                }
+                            }
+                        } else {
+                            if (preferredServerId == server.id) {
+                                OutlinedButton(onClick = { onSelectServer(null) }, enabled = !isBusy) {
+                                    Text("Selected for provisioning (tap for Auto)")
+                                }
+                            } else {
+                                OutlinedButton(
+                                    onClick = { onSelectServer(server.id) },
+                                    enabled = !isBusy && isHealthyAndAvailable && tierAllowed,
+                                ) {
+                                    Text(
+                                        if (!tierAllowed) "Requires Premium"
+                                        else "Select ${server.id}",
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
             }
         } else if (serversLoaded && !serversLoading) {
             Spacer(Modifier.height(8.dp))
@@ -681,4 +871,49 @@ private fun formatBytes(bytes: Long): String {
         index++
     }
     return String.format(Locale.US, "%.1f %s", value, units[index])
+}
+
+internal fun isBrowserPackage(packageName: String, label: String): Boolean {
+    val pkg = packageName.lowercase(Locale.US)
+    val lbl = label.lowercase(Locale.US)
+    return pkg.contains("browser") ||
+        pkg.contains("chrome") ||
+        pkg.contains("firefox") ||
+        pkg.contains("mozilla") ||
+        pkg.contains("brave") ||
+        pkg.contains("opera") ||
+        pkg.contains("duckduckgo") ||
+        pkg.contains("vivaldi") ||
+        lbl.contains("browser")
+}
+
+internal fun isMessengerPackage(packageName: String, label: String): Boolean {
+    val pkg = packageName.lowercase(Locale.US)
+    val lbl = label.lowercase(Locale.US)
+    return pkg.contains("telegram") ||
+        pkg.contains("whatsapp") ||
+        pkg.contains("signal") ||
+        pkg.contains("discord") ||
+        pkg.contains("messenger") ||
+        pkg.contains("viber") ||
+        pkg.contains("slack") ||
+        pkg.contains("element") ||
+        lbl.contains("telegram") ||
+        lbl.contains("whatsapp") ||
+        lbl.contains("signal") ||
+        lbl.contains("discord")
+}
+
+internal fun isMediaPackage(packageName: String, label: String): Boolean {
+    val pkg = packageName.lowercase(Locale.US)
+    val lbl = label.lowercase(Locale.US)
+    return pkg.contains("youtube") ||
+        pkg.contains("spotify") ||
+        pkg.contains("netflix") ||
+        pkg.contains("twitch") ||
+        pkg.contains("music") ||
+        pkg.contains("video") ||
+        pkg.contains("plex") ||
+        lbl.contains("youtube") ||
+        lbl.contains("spotify")
 }

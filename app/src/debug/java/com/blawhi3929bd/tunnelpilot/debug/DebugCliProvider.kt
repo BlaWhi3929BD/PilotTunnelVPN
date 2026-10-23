@@ -46,6 +46,26 @@ class DebugCliProvider : ContentProvider() {
                 "rotate_key" -> {
                     controller.rotateDeviceKeyNow().map { "rotated key for ${it.deviceId}" }
                 }
+                "migrate_server" -> {
+                    val targetServerId = arg?.trim().orEmpty()
+                    if (targetServerId.isEmpty()) {
+                        Result.failure(IllegalArgumentException("Missing server_id argument for migrate_server"))
+                    } else {
+                        controller.migrateServerNow(targetServerId).map {
+                            "migrated to ${it.serverId} (${it.clientAddress})"
+                        }
+                    }
+                }
+                "select_server" -> runCatching {
+                    val serverId = arg?.trim()?.takeIf { it.isNotEmpty() && !it.equals("auto", ignoreCase = true) }
+                    controller.setPreferredServerId(serverId)
+                    "preferred_server_id=${serverId ?: "auto"}"
+                }
+                "select_region" -> runCatching {
+                    val region = arg?.trim()?.takeIf { it.isNotEmpty() && !it.equals("auto", ignoreCase = true) }
+                    controller.setPreferredRegion(region)
+                    "preferred_region=${region ?: "auto"}"
+                }
                 "connect" -> {
                     controller.connectNow().map { "connected" }
                 }
@@ -88,7 +108,7 @@ class DebugCliProvider : ContentProvider() {
                 "check_servers", "servers" -> {
                     controller.refreshServersNow().map { list ->
                         list.joinToString(";") { srv ->
-                            "${srv.id}:${srv.healthStatus}(${srv.peerCount ?: 0}/${srv.peerCapacity ?: 0})"
+                            "${srv.id}[${srv.region}/${srv.tier}]:${srv.healthStatus}(${srv.peerCount ?: 0}/${srv.peerCapacity ?: 0})"
                         }.ifEmpty { "no_servers" }
                     }
                 }
@@ -130,6 +150,10 @@ class DebugCliProvider : ContentProvider() {
                 putString("provisioning_status", snapshot.provisioningStatus)
                 putString("device_id", snapshot.deviceId)
                 putString("client_address", snapshot.clientAddress ?: "")
+                putString("assigned_server_id", snapshot.assignedServerId ?: "")
+                putString("preferred_server_id", snapshot.preferredServerId ?: "")
+                putString("preferred_region", snapshot.preferredRegion ?: "")
+                putString("device_tier", snapshot.deviceTier)
                 putBoolean("has_device_token", snapshot.hasDeviceToken)
                 putBoolean("vpn_permission_required", snapshot.vpnPermissionRequired)
                 snapshot.errorMessage?.let { putString("error", it) }

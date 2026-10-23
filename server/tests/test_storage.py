@@ -137,3 +137,90 @@ def test_device_store_backup_and_restore_from_recovers_state_and_rejects_corrupt
             vpn_gateway_address="10.67.0.1",
         )
     assert store.get("device-alpha") is not None
+
+
+def test_device_store_migrates_legacy_single_server_schema_and_supports_per_server_pools(tmp_path) -> None:
+    import sqlite3
+
+    db_path = tmp_path / "legacy.db"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE devices (
+                device_id TEXT PRIMARY KEY,
+                client_public_key TEXT NOT NULL UNIQUE,
+                app_version TEXT NOT NULL,
+                server_id TEXT NOT NULL,
+                client_address TEXT NOT NULL UNIQUE,
+                created_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                provisioned INTEGER NOT NULL DEFAULT 1,
+                device_token_hash TEXT
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO devices (
+                device_id, client_public_key, app_version, server_id,
+                client_address, created_at, last_seen_at, provisioned, device_token_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-dev-1",
+                KEY_ONE,
+                "0.2.0",
+                "dev-lan-1",
+                "10.67.0.2/32",
+                "2026-10-08T00:00:00+00:00",
+                "2026-10-08T00:00:00+00:00",
+                1,
+                "legacy-hash",
+            ),
+        )
+
+    store = DeviceStore(db_path)
+    migrated = store.get("legacy-dev-1")
+    assert migrated is not None
+    assert migrated["server_id"] == "dev-lan-1"
+    assert migrated["client_address"] == "10.67.0.2/32"
+    assert migrated["tier"] == "free"
+    assert store.get_server("dev-lan-1") is not None
+
+    # Create a second server and verify it can allocate from its own or overlapping pool
+    store.create_server(
+        server_id="eu-central-2",
+        region="eu-central",
+        hostname="eu2.vpn.example.com",
+        port=51820,
+        public_key=KEY_TWO,
+        enabled=True,
+        gateway_api_url="http://127.0.0.1:8788",
+        gateway_agent_token="tok-2",
+        vpn_address_pool="10.67.0.0/24",
+        vpn_gateway_address="10.67.0.1",
+        peer_capacity=2,
+        tier="free",
+    )
+    second = store.create(
+        device_id="device-eu2",
+        client_public_key=KEY_TWO,
+        app_version="0.2.0",
+        server_id="eu-central-2",
+        created_at="2026-10-08T00:01:00+00:00",
+        last_seen_at="2026-10-08T00:01:00+00:00",
+        vpn_address_pool="10.67.0.0/24",
+        vpn_gateway_address="10.67.0.1",
+        device_token_hash="hash-2",
+        peer_capacity=2,
+    )
+    # Because UNIQUE is now (server_id, client_address), eu-central-2 can also allocate 10.67.0.2/32
+    assert second["client_address"] == "10.67.0.2/32"
+
+    # Deleting a server with assigned devices is blocked
+    with pytest.raises(ValueError, match="Cannot delete server"):
+        store.delete_server("eu-central-2")
+
+    store.delete("device-eu2")
+    store.delete_server("eu-central-2")
+    assert store.get_server("eu-central-2") is None

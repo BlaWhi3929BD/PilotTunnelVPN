@@ -88,6 +88,15 @@ case "$cmd" in
   rotate-key|rotate_key|rotate)
     call_cli "rotate_key"
     ;;
+  migrate-server|migrate_server|migrate)
+    call_cli "migrate_server" "${1:?Usage: $0 migrate-server <server_id>}"
+    ;;
+  select-server|select_server)
+    call_cli "select_server" "${1:-auto}"
+    ;;
+  select-region|select_region)
+    call_cli "select_region" "${1:-auto}"
+    ;;
   connect)
     call_cli "connect"
     ;;
@@ -124,7 +133,10 @@ Commands:
   status                         Show current VPN, routing, and provisioning status
   servers                        Query Control Plane /v1/servers health and capacity from the phone
   set-url <url>                  Update Control Plane URL
+  select-server <server_id|auto> Set preferred server ID for initial provisioning
+  select-region <region|auto>    Set preferred region for initial provisioning
   provision [url]                Provision device (optionally setting Control Plane URL first)
+  migrate-server <server_id>     Explicitly migrate provisioned device to another server
   rotate-key                     Generate a new WireGuard keypair and rotate it on the server
   connect                        Connect the WireGuard VPN tunnel
   disconnect                     Disconnect the WireGuard VPN tunnel

@@ -50,6 +50,10 @@ data class ControllerStatusSnapshot(
     val clientAddress: String?,
     val hasDeviceToken: Boolean,
     val vpnPermissionRequired: Boolean,
+    val assignedServerId: String? = null,
+    val preferredServerId: String? = null,
+    val preferredRegion: String? = null,
+    val deviceTier: String = "free",
 )
 
 class TunnelPilotController internal constructor(
@@ -98,6 +102,21 @@ class TunnelPilotController internal constructor(
 
     private val _controlPlaneUrl = MutableStateFlow(settingsStore.getControlPlaneUrl())
     val controlPlaneUrl: StateFlow<String> = _controlPlaneUrl.asStateFlow()
+
+    private val _preferredServerId = MutableStateFlow(settingsStore.getPreferredServerId())
+    val preferredServerId: StateFlow<String?> = _preferredServerId.asStateFlow()
+
+    private val _preferredRegion = MutableStateFlow(settingsStore.getPreferredRegion())
+    val preferredRegion: StateFlow<String?> = _preferredRegion.asStateFlow()
+
+    private val _assignedServerId = MutableStateFlow(settingsStore.getAssignedServerId())
+    val assignedServerId: StateFlow<String?> = _assignedServerId.asStateFlow()
+
+    private val _deviceTier = MutableStateFlow(settingsStore.getDeviceTier())
+    val deviceTier: StateFlow<String> = _deviceTier.asStateFlow()
+
+    private val _adsConsent = MutableStateFlow(settingsStore.getAdsConsent())
+    val adsConsent: StateFlow<Boolean> = _adsConsent.asStateFlow()
 
     private val _provisioningState = MutableStateFlow(loadPersistedProvisioningState())
     val provisioningState: StateFlow<ProvisioningState> = _provisioningState.asStateFlow()
@@ -154,6 +173,7 @@ class TunnelPilotController internal constructor(
             deviceId = identityStore.getOrCreateDeviceId(),
             clientAddress = address,
             lastError = lastError,
+            serverId = settingsStore.getAssignedServerId(),
         )
     }
 
@@ -227,6 +247,23 @@ class TunnelPilotController internal constructor(
         _serversError.value = null
     }
 
+    fun setPreferredServerId(serverId: String?) {
+        val cleaned = serverId?.trim()?.takeIf { it.isNotEmpty() }
+        _preferredServerId.value = cleaned
+        settingsStore.setPreferredServerId(cleaned)
+    }
+
+    fun setPreferredRegion(region: String?) {
+        val cleaned = region?.trim()?.takeIf { it.isNotEmpty() }
+        _preferredRegion.value = cleaned
+        settingsStore.setPreferredRegion(cleaned)
+    }
+
+    fun setAdsConsent(consented: Boolean) {
+        _adsConsent.value = consented
+        settingsStore.setAdsConsent(consented)
+    }
+
     fun refreshServers() {
         scope.launch {
             refreshServersNow()
@@ -277,6 +314,7 @@ class TunnelPilotController internal constructor(
                 }
             val deviceId = identityStore.getOrCreateDeviceId()
             val existingToken = identityStore.loadDeviceToken()
+            val pinnedServerId = settingsStore.getAssignedServerId()
 
             val baseUrl = _controlPlaneUrl.value.trim()
             require(baseUrl.isNotBlank()) { "Control plane URL is required" }
@@ -287,11 +325,25 @@ class TunnelPilotController internal constructor(
             ).toBase64()
 
             val registration = try {
+                // Only send preferredServerId/preferredRegion on initial registration;
+                // once pinned, re-provisioning preserves the pinned server (switching servers uses migrateServerNow).
+                val requestedServerId = if (existingToken == null || pinnedServerId == null) {
+                    _preferredServerId.value
+                } else {
+                    null
+                }
+                val requestedRegion = if (existingToken == null || pinnedServerId == null) {
+                    _preferredRegion.value
+                } else {
+                    null
+                }
                 client.registerDevice(
                     deviceId = deviceId,
                     publicKey = publicKey,
                     appVersion = BuildConfig.VERSION_NAME,
                     deviceToken = existingToken,
+                    preferredServerId = requestedServerId,
+                    preferredRegion = requestedRegion,
                 )
             } catch (conflict: ControlPlaneHttpException) {
                 if (conflict.statusCode == 409 && existingToken != null) {
@@ -318,6 +370,7 @@ class TunnelPilotController internal constructor(
                         provisioned = rotated.provisioned,
                         server = rotated.server,
                         deviceToken = null,
+                        tier = rotated.tier,
                     )
                 } else {
                     throw conflict
@@ -336,10 +389,15 @@ class TunnelPilotController internal constructor(
             configStore.save(config)
             _configPresent.value = true
             _reconnectRequired.value = false
+            _assignedServerId.value = registration.server.id
+            settingsStore.setAssignedServerId(registration.server.id)
+            _deviceTier.value = registration.tier
+            settingsStore.setDeviceTier(registration.tier)
             val provisioned = ProvisioningState.Provisioned(
                 deviceId = registration.deviceId,
                 clientAddress = registration.clientAddress,
                 lastError = null,
+                serverId = registration.server.id,
             )
             _provisioningState.value = provisioned
             provisioned
@@ -413,10 +471,15 @@ class TunnelPilotController internal constructor(
                 identityStore.clearPendingPrivateKey()
                 _configPresent.value = true
                 _reconnectRequired.value = false
+                _assignedServerId.value = rotation.server.id
+                settingsStore.setAssignedServerId(rotation.server.id)
+                _deviceTier.value = rotation.tier
+                settingsStore.setDeviceTier(rotation.tier)
                 val provisioned = ProvisioningState.Provisioned(
                     deviceId = rotation.deviceId,
                     clientAddress = rotation.clientAddress,
                     lastError = null,
+                    serverId = rotation.server.id,
                 )
                 _provisioningState.value = provisioned
                 provisioned
@@ -440,6 +503,99 @@ class TunnelPilotController internal constructor(
             _provisioningState.value = resolveProvisioningStateAfterFailure(
                 error.message ?: "Unable to rotate the device key",
             )
+        }
+    }
+
+    fun migrateServer(targetServerId: String) {
+        scope.launch {
+            migrateServerNow(targetServerId)
+        }
+    }
+
+    suspend fun migrateServerNow(targetServerId: String): Result<ProvisioningState.Provisioned> = operationMutex.withLock {
+        syncBackendState()
+        if (_state.value.isActive()) {
+            val msg = "Disconnect the VPN before switching to another server"
+            _provisioningState.value = resolveProvisioningStateAfterFailure(msg)
+            return@withLock Result.failure(IllegalStateException(msg))
+        }
+
+        _provisioningState.value = ProvisioningState.Provisioning
+        runCatching {
+            val cleanedTarget = targetServerId.trim()
+            require(cleanedTarget.isNotEmpty()) { "Target server ID is required" }
+            val deviceId = identityStore.getOrCreateDeviceId()
+            val deviceToken = identityStore.loadDeviceToken()
+                ?: error("Device must be provisioned before migrating servers")
+            val activePrivateKey = identityStore.loadPrivateKey()
+                ?: error("Local WireGuard private key is missing; re-provision the device")
+            val baseUrl = _controlPlaneUrl.value.trim()
+            require(baseUrl.isNotBlank()) { "Control plane URL is required" }
+            val client = controlPlaneClientFactory(baseUrl)
+
+            val migration = client.migrateDevice(
+                deviceId = deviceId,
+                targetServerId = cleanedTarget,
+                appVersion = BuildConfig.VERSION_NAME,
+                deviceToken = deviceToken,
+            )
+
+            val config = WireGuardConfigFactory.create(
+                privateKey = activePrivateKey,
+                clientAddress = migration.clientAddress,
+                server = migration.server,
+            )
+            Config.parse(ByteArrayInputStream(config.toByteArray(Charsets.UTF_8)))
+            configStore.save(config)
+            _configPresent.value = true
+            _reconnectRequired.value = false
+            _assignedServerId.value = migration.server.id
+            settingsStore.setAssignedServerId(migration.server.id)
+            _preferredServerId.value = migration.server.id
+            settingsStore.setPreferredServerId(migration.server.id)
+            _deviceTier.value = migration.tier
+            settingsStore.setDeviceTier(migration.tier)
+            val provisioned = ProvisioningState.Provisioned(
+                deviceId = migration.deviceId,
+                clientAddress = migration.clientAddress,
+                lastError = null,
+                serverId = migration.server.id,
+            )
+            _provisioningState.value = provisioned
+            provisioned
+        }.onFailure { error ->
+            _provisioningState.value = resolveProvisioningStateAfterFailure(
+                error.message ?: "Unable to migrate to the requested server",
+            )
+        }
+    }
+
+    fun upgradeTier(tier: String, purchaseToken: String? = null) {
+        scope.launch {
+            upgradeTierNow(tier, purchaseToken)
+        }
+    }
+
+    suspend fun upgradeTierNow(tier: String, purchaseToken: String? = null): Result<String> = operationMutex.withLock {
+        runCatching {
+            val normalized = if (tier.trim().equals("premium", ignoreCase = true)) "premium" else "free"
+            val deviceToken = identityStore.loadDeviceToken()
+            val baseUrl = _controlPlaneUrl.value.trim()
+            if (deviceToken != null && baseUrl.isNotBlank()) {
+                val res = controlPlaneClientFactory(baseUrl).updateDeviceTier(
+                    deviceId = identityStore.getOrCreateDeviceId(),
+                    tier = normalized,
+                    purchaseToken = purchaseToken,
+                    deviceToken = deviceToken,
+                )
+                _deviceTier.value = res.tier
+                settingsStore.setDeviceTier(res.tier)
+                res.tier
+            } else {
+                _deviceTier.value = normalized
+                settingsStore.setDeviceTier(normalized)
+                normalized
+            }
         }
     }
 
@@ -489,6 +645,8 @@ class TunnelPilotController internal constructor(
             _hasDeviceToken.value = false
             _configPresent.value = false
             _reconnectRequired.value = false
+            _assignedServerId.value = null
+            settingsStore.setAssignedServerId(null)
             _provisioningState.value = ProvisioningState.NotConfigured
         }.onFailure { error ->
             _provisioningState.value = resolveProvisioningStateAfterFailure(
@@ -532,6 +690,8 @@ class TunnelPilotController internal constructor(
             _hasDeviceToken.value = false
             _configPresent.value = false
             _reconnectRequired.value = false
+            _assignedServerId.value = null
+            settingsStore.setAssignedServerId(null)
             _provisioningState.value = ProvisioningState.NotConfigured
             newDeviceId
         }.onFailure { error ->
@@ -639,6 +799,7 @@ class TunnelPilotController internal constructor(
             is ProvisioningState.Provisioned -> Triple("Provisioned", currentProv.clientAddress, currentProv.lastError)
             is ProvisioningState.Error -> Triple("Error", extractClientAddress(configStore.load()), currentProv.message)
         }
+        val currentAssigned = (currentProv as? ProvisioningState.Provisioned)?.serverId ?: _assignedServerId.value
         return ControllerStatusSnapshot(
             vpnState = vpnLabel,
             rxBytes = rx,
@@ -654,6 +815,10 @@ class TunnelPilotController internal constructor(
             clientAddress = clientAddr,
             hasDeviceToken = identityStore.loadDeviceToken() != null,
             vpnPermissionRequired = requiredVpnPermissionIntent() != null,
+            assignedServerId = currentAssigned,
+            preferredServerId = _preferredServerId.value,
+            preferredRegion = _preferredRegion.value,
+            deviceTier = _deviceTier.value,
         )
     }
 

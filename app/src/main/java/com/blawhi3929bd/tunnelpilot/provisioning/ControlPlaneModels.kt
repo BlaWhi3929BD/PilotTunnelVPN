@@ -10,6 +10,7 @@ data class RegisteredServer(
     val peerCount: Int? = null,
     val peerCapacity: Int? = null,
     val capacityRemaining: Int? = null,
+    val tier: String = "free",
 )
 
 data class RotationResult(
@@ -18,6 +19,7 @@ data class RotationResult(
     val clientAddress: String,
     val provisioned: Boolean,
     val server: RegisteredServer,
+    val tier: String = "free",
 )
 
 data class RegistrationResult(
@@ -26,4 +28,21 @@ data class RegistrationResult(
     val provisioned: Boolean,
     val server: RegisteredServer,
     val deviceToken: String?,
+    val tier: String = "free",
+)
+
+data class MigrationResult(
+    val status: String,
+    val deviceId: String,
+    val previousServerId: String,
+    val clientAddress: String,
+    val provisioned: Boolean,
+    val server: RegisteredServer,
+    val tier: String = "free",
+)
+
+data class TierUpdateResult(
+    val status: String,
+    val deviceId: String,
+    val tier: String,
 )

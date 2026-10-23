@@ -1258,3 +1258,367 @@ def test_production_enforces_https_on_credentialed_endpoints() -> None:
     assert created.status_code == 200
     rec = client.post("/v1/servers/reconcile", json={"dry_run": True}, headers=secure_headers)
     assert rec.status_code == 200
+
+
+def test_admin_server_crud_enforces_bearer_auth_ssrf_guards_and_delete_dependencies() -> None:
+    main.ALLOW_OPEN_REGISTRATION = True
+    main.CONTROL_PLANE_TOKEN = "admin-crud-secret"
+    admin_headers = {"Authorization": "Bearer admin-crud-secret"}
+
+    new_server_payload = {
+        "id": "us-east-1",
+        "region": "us-east",
+        "hostname": "us1.vpn.example.com",
+        "port": 51820,
+        "public_key": ANOTHER_PUBLIC_KEY,
+        "enabled": True,
+        "gateway_api_url": "http://127.0.0.1:8788",
+        "gateway_agent_token": "gw-us-east-token",
+        "vpn_address_pool": "10.68.0.0/29",
+        "vpn_gateway_address": "10.68.0.1",
+        "peer_capacity": 4,
+        "tier": "free",
+    }
+
+    # Unauthenticated or wrong token rejected even with ALLOW_OPEN_REGISTRATION=true
+    assert client.post("/v1/servers", json=new_server_payload).status_code == 401
+    assert client.patch("/v1/servers/dev-lan-1", json={"enabled": False}).status_code == 401
+    assert client.delete("/v1/servers/dev-lan-1").status_code == 401
+    assert client.get("/v1/servers?include_disabled=true").status_code == 401
+
+    # SSRF validation blocks cloud metadata and non-http schemes
+    ssrf_payload = {**new_server_payload, "gateway_api_url": "http://169.254.169.254/latest/meta-data"}
+    assert client.post("/v1/servers", json=ssrf_payload, headers=admin_headers).status_code == 422
+    scheme_payload = {**new_server_payload, "gateway_api_url": "file:///etc/passwd"}
+    assert client.post("/v1/servers", json=scheme_payload, headers=admin_headers).status_code == 422
+
+    # Create server succeeds with admin Bearer token and never leaks gateway_agent_token in response
+    created_srv = client.post("/v1/servers", json=new_server_payload, headers=admin_headers)
+    assert created_srv.status_code == 201
+    body = created_srv.json()
+    assert body["id"] == "us-east-1"
+    assert "gateway_agent_token" not in body
+
+    # Duplicate server id returns 409
+    assert client.post("/v1/servers", json=new_server_payload, headers=admin_headers).status_code == 409
+
+    # Filter by region
+    us_servers = client.get("/v1/servers?region=us-east").json()
+    assert [s["id"] for s in us_servers] == ["us-east-1"]
+
+    # Disable and list with include_disabled=true
+    patched = client.patch(
+        "/v1/servers/us-east-1",
+        json={"enabled": False},
+        headers=admin_headers,
+    )
+    assert patched.status_code == 200
+    assert patched.json()["enabled"] is False
+    assert "us-east-1" not in [s["id"] for s in client.get("/v1/servers").json()]
+    assert "us-east-1" in [
+        s["id"] for s in client.get("/v1/servers?include_disabled=true", headers=admin_headers).json()
+    ]
+
+    # Re-enable without gateway_api_url so we can register a device and test delete guard
+    client.patch(
+        "/v1/servers/us-east-1",
+        json={"enabled": True, "gateway_api_url": None},
+        headers=admin_headers,
+    )
+    reg = client.post(
+        "/v1/devices",
+        json={
+            "device_id": "pinned-us-device",
+            "client_public_key": VALID_PUBLIC_KEY,
+            "app_version": "0.2.0",
+            "server_id": "us-east-1",
+        },
+    )
+    assert reg.status_code == 200
+    assert reg.json()["server"]["id"] == "us-east-1"
+    assert reg.json()["client_address"] == "10.68.0.2/32"
+
+    # Deleting a server with assigned devices returns 409 Conflict
+    del_conflict = client.delete("/v1/servers/us-east-1", headers=admin_headers)
+    assert del_conflict.status_code == 409
+
+    # After revoking the device, server deletion succeeds
+    assert client.delete("/v1/devices/pinned-us-device", headers=admin_headers).status_code == 200
+    del_ok = client.delete("/v1/servers/us-east-1", headers=admin_headers)
+    assert del_ok.status_code == 200
+    assert del_ok.json()["status"] == "deleted"
+
+
+def test_device_server_pinning_migration_rollback_tombstone_and_multi_server_reconcile(monkeypatch) -> None:
+    main.ALLOW_OPEN_REGISTRATION = True
+    main.CONTROL_PLANE_TOKEN = "admin-migrate-secret"
+    admin_headers = {"Authorization": "Bearer admin-migrate-secret"}
+
+    gw_peers_by_url: dict[str, dict[str, list[str]]] = {
+        "http://127.0.0.1:8787": {},
+        "http://127.0.0.1:8788": {},
+    }
+    fail_post_on_url: set[str] = set()
+    fail_delete_on_url: set[str] = set()
+    offline_urls: set[str] = set()
+
+    class FakeResp:
+        def __init__(self, status_code: int = 200, text: str = "ok", payload: dict | None = None):
+            self.status_code = status_code
+            self.text = text
+            self._payload = payload or {"status": "ok"}
+
+        def json(self):
+            return self._payload
+
+    class MultiGatewayClient:
+        def __init__(self, *args, **kwargs):
+            self.base_url = kwargs.get("base_url", "")
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path):
+            if self.base_url in offline_urls:
+                raise main.httpx.ConnectError("gateway offline")
+            peers = gw_peers_by_url.setdefault(self.base_url, {})
+            return FakeResp(
+                payload={
+                    "status": "ok",
+                    "wireguard_available": True,
+                    "peer_count": len(peers),
+                    "peer_capacity": 240,
+                    "capacity_remaining": 240 - len(peers),
+                }
+            )
+
+        def request(self, method, path, *, headers, json=None):
+            if self.base_url in offline_urls:
+                raise main.httpx.ConnectError("gateway offline")
+            peers = gw_peers_by_url.setdefault(self.base_url, {})
+            if method == "GET" and path == "/v1/peers":
+                return FakeResp(
+                    payload={
+                        "interface": "tunnelpilot0",
+                        "peers": list(peers.keys()),
+                        "peer_allowed_ips": {k: list(v) for k, v in peers.items()},
+                    }
+                )
+            if method == "POST" and path == "/v1/peers" and json:
+                if self.base_url in fail_post_on_url:
+                    return FakeResp(status_code=500, text="target gateway error")
+                peers[json["public_key"]] = [json["allowed_ip"]]
+                return FakeResp()
+            if method == "DELETE" and path.startswith("/v1/peers?public_key="):
+                if self.base_url in fail_delete_on_url:
+                    return FakeResp(status_code=500, text="source gateway revoke error")
+                from urllib.parse import unquote
+
+                key = unquote(path.split("public_key=", 1)[1])
+                peers.pop(key, None)
+                return FakeResp()
+            return FakeResp()
+
+    monkeypatch.setattr(main.httpx, "Client", MultiGatewayClient)
+    main.GATEWAY_AGENT_URL = "http://127.0.0.1:8787"
+    main.GATEWAY_AGENT_TOKEN = "token-gw-1"
+    default_id = main.SERVERS[0].id
+
+    # Add second server (eu-west-2) with its own pool and gateway URL
+    create_resp = client.post(
+        "/v1/servers",
+        headers=admin_headers,
+        json={
+            "id": "eu-west-2",
+            "region": "eu-west",
+            "hostname": "eu-west-2.vpn.example.com",
+            "port": 51820,
+            "public_key": ANOTHER_PUBLIC_KEY,
+            "enabled": True,
+            "gateway_api_url": "http://127.0.0.1:8788",
+            "gateway_agent_token": "token-gw-2",
+            "vpn_address_pool": "10.69.0.0/24",
+            "vpn_gateway_address": "10.69.0.1",
+            "peer_capacity": 240,
+            "tier": "free",
+        },
+    )
+    assert create_resp.status_code == 201
+
+    # 1. Register device on default server
+    reg = client.post(
+        "/v1/devices",
+        json={
+            "device_id": "device-mig-1",
+            "client_public_key": VALID_PUBLIC_KEY,
+            "app_version": "0.2.0",
+            "server_id": default_id,
+        },
+    )
+    assert reg.status_code == 200
+    token = reg.json()["device_token"]
+    assert reg.json()["server"]["id"] == default_id
+    assert reg.json()["client_address"] == "10.67.0.2/32"
+    assert VALID_PUBLIC_KEY in gw_peers_by_url["http://127.0.0.1:8787"]
+
+    # 2. Re-registration without server_id stays pinned to default_id; passing a different server_id returns 409
+    re_reg = client.post(
+        "/v1/devices",
+        json={
+            "device_id": "device-mig-1",
+            "client_public_key": VALID_PUBLIC_KEY,
+            "app_version": "0.2.0",
+        },
+        headers={"X-Device-Token": token},
+    )
+    assert re_reg.status_code == 200
+    assert re_reg.json()["server"]["id"] == default_id
+
+    pinned_conflict = client.post(
+        "/v1/devices",
+        json={
+            "device_id": "device-mig-1",
+            "client_public_key": VALID_PUBLIC_KEY,
+            "app_version": "0.2.0",
+            "server_id": "eu-west-2",
+        },
+        headers={"X-Device-Token": token},
+    )
+    assert pinned_conflict.status_code == 409
+
+    # 3. Migration rollback if target gateway fails to install peer: device stays on default_id
+    fail_post_on_url.add("http://127.0.0.1:8788")
+    failed_mig = client.post(
+        "/v1/devices/device-mig-1/migrate",
+        json={"target_server_id": "eu-west-2", "app_version": "0.2.0"},
+        headers={"X-Device-Token": token},
+    )
+    assert failed_mig.status_code == 502
+    assert main.DEVICE_STORE.get("device-mig-1")["server_id"] == default_id
+    assert VALID_PUBLIC_KEY in gw_peers_by_url["http://127.0.0.1:8787"]
+    fail_post_on_url.clear()
+
+    # 4. Migration succeeds even if source gateway revocation fails transiently; records tombstone for source server
+    fail_delete_on_url.add("http://127.0.0.1:8787")
+    ok_mig = client.post(
+        "/v1/devices/device-mig-1/migrate",
+        json={"target_server_id": "eu-west-2", "app_version": "0.2.0"},
+        headers={"X-Device-Token": token},
+    )
+    assert ok_mig.status_code == 200
+    mig_body = ok_mig.json()
+    assert mig_body["previous_server_id"] == default_id
+    assert mig_body["server"]["id"] == "eu-west-2"
+    assert mig_body["client_address"] == "10.69.0.2/32"
+    assert VALID_PUBLIC_KEY in gw_peers_by_url["http://127.0.0.1:8788"]
+    # Source gateway still has the stale peer until reconciled, and tombstone is recorded
+    assert VALID_PUBLIC_KEY in gw_peers_by_url["http://127.0.0.1:8787"]
+    assert len(main.DEVICE_STORE.list_tombstones(default_id)) == 1
+
+    # 5. Non-destructive reconciliation (prune_unknown=False) on default_id automatically removes the tombstoned peer!
+    fail_delete_on_url.clear()
+    rec_dev1 = client.post(
+        f"/v1/servers/{default_id}/reconcile",
+        json={"dry_run": False, "prune_unknown": False},
+        headers=admin_headers,
+    )
+    assert rec_dev1.status_code == 200
+    assert rec_dev1.json()["removed_peers"] == 1
+    assert VALID_PUBLIC_KEY not in gw_peers_by_url["http://127.0.0.1:8787"]
+    assert len(main.DEVICE_STORE.list_tombstones(default_id)) == 0
+
+    # 6. Batch reconciliation isolates an offline gateway without aborting healthy servers
+    offline_urls.add("http://127.0.0.1:8787")
+    batch = client.post("/v1/servers/reconcile", json={"dry_run": True}, headers=admin_headers)
+    assert batch.status_code == 200
+    by_id = {item["server_id"]: item for item in batch.json()}
+    assert by_id[default_id]["status"] == "error"
+    assert by_id["eu-west-2"]["status"] == "dry_run"
+
+
+def test_premium_server_tier_enforcement_and_device_tier_upgrade() -> None:
+    main.ALLOW_OPEN_REGISTRATION = True
+    main.CONTROL_PLANE_TOKEN = "admin-tier-secret"
+    admin_headers = {"Authorization": "Bearer admin-tier-secret"}
+
+    # Create a premium server
+    created = client.post(
+        "/v1/servers",
+        headers=admin_headers,
+        json={
+            "id": "ch-zurich-premium",
+            "region": "eu-central",
+            "hostname": "ch1.vpn.example.com",
+            "port": 51820,
+            "public_key": ANOTHER_PUBLIC_KEY,
+            "enabled": True,
+            "vpn_address_pool": "10.70.0.0/24",
+            "vpn_gateway_address": "10.70.0.1",
+            "peer_capacity": 100,
+            "tier": "premium",
+        },
+    )
+    assert created.status_code == 201
+    assert created.json()["tier"] == "premium"
+
+    # Free device registration directly onto premium server is rejected with 403
+    denied = client.post(
+        "/v1/devices",
+        json={
+            "device_id": "device-tier-1",
+            "client_public_key": VALID_PUBLIC_KEY,
+            "app_version": "0.2.0",
+            "server_id": "ch-zurich-premium",
+        },
+    )
+    assert denied.status_code == 403
+
+    # Register on default free server first
+    reg = client.post(
+        "/v1/devices",
+        json={
+            "device_id": "device-tier-1",
+            "client_public_key": VALID_PUBLIC_KEY,
+            "app_version": "0.2.0",
+        },
+    )
+    assert reg.status_code == 200
+    token = reg.json()["device_token"]
+    assert reg.json()["tier"] == "free"
+
+    # Migrating to premium server while still on free tier returns 403
+    mig_denied = client.post(
+        "/v1/devices/device-tier-1/migrate",
+        json={"target_server_id": "ch-zurich-premium", "app_version": "0.2.0"},
+        headers={"X-Device-Token": token},
+    )
+    assert mig_denied.status_code == 403
+
+    # Upgrading to premium without purchase_token is rejected with 403
+    unverified_upgrade = client.post(
+        "/v1/devices/device-tier-1/tier",
+        json={"tier": "premium"},
+        headers={"X-Device-Token": token},
+    )
+    assert unverified_upgrade.status_code == 403
+
+    # Upgrade device to premium tier with valid purchase_token and migrate
+    upgraded = client.post(
+        "/v1/devices/device-tier-1/tier",
+        json={"tier": "premium", "purchase_token": "play-billing-token-12345"},
+        headers={"X-Device-Token": token},
+    )
+    assert upgraded.status_code == 200
+    assert upgraded.json()["tier"] == "premium"
+
+    mig_ok = client.post(
+        "/v1/devices/device-tier-1/migrate",
+        json={"target_server_id": "ch-zurich-premium", "app_version": "0.2.0"},
+        headers={"X-Device-Token": token},
+    )
+    assert mig_ok.status_code == 200
+    assert mig_ok.json()["server"]["id"] == "ch-zurich-premium"
+    assert mig_ok.json()["tier"] == "premium"

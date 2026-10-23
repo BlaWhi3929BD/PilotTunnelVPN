@@ -11,6 +11,7 @@ import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
 import com.blawhi3929bd.tunnelpilot.provisioning.RegisteredServer
 import com.blawhi3929bd.tunnelpilot.provisioning.RegistrationResult
 import com.blawhi3929bd.tunnelpilot.provisioning.RotationResult
+import com.blawhi3929bd.tunnelpilot.provisioning.MigrationResult
 import com.wireguard.android.backend.Statistics
 import com.wireguard.android.backend.Tunnel
 import com.wireguard.crypto.TunnelPilotKeyGenerator
@@ -394,6 +395,46 @@ class TunnelPilotControllerTest {
         assertEquals("Disconnected", controller.statusSnapshot().vpnState)
     }
 
+    @Test
+    fun migrateServer_pinsServerAndUpdatesConfiguration() = runBlocking {
+        val controller = createController()
+        assertTrue(controller.provisionNow().isSuccess)
+        assertEquals("srv-1", controller.assignedServerId.value)
+        assertEquals("srv-1", controller.statusSnapshot().assignedServerId)
+
+        val targetServerPublicKey = TunnelPilotKeyGenerator.generatePublicKey(
+            TunnelPilotKeyGenerator.generatePrivateKey(),
+        ).toBase64()
+        val targetServer = RegisteredServer(
+            id = "srv-2",
+            region = "eu-west",
+            hostname = "127.0.0.1",
+            publicKey = targetServerPublicKey,
+            port = 51821,
+            healthStatus = "ok",
+            tier = "free",
+        )
+        controlPlane.migrateBehavior = { deviceId, targetServerId, appVersion, deviceToken ->
+            MigrationResult(
+                status = "migrated",
+                deviceId = deviceId,
+                previousServerId = "srv-1",
+                clientAddress = "10.68.0.2/32",
+                provisioned = true,
+                server = targetServer,
+                tier = "free",
+            )
+        }
+
+        val migrated = controller.migrateServerNow("srv-2")
+        assertTrue(migrated.isSuccess)
+        assertEquals("srv-2", controller.assignedServerId.value)
+        assertEquals("srv-2", controller.statusSnapshot().assignedServerId)
+        assertEquals("10.68.0.2/32", controller.statusSnapshot().clientAddress)
+        assertTrue(configStore.load()!!.contains("10.68.0.2/32"))
+        assertTrue(configStore.load()!!.contains(targetServerPublicKey))
+    }
+
     private class FakeTunnelBackend : TunnelBackend {
         private var state: Tunnel.State = Tunnel.State.DOWN
         var lastConnectedConfig: String? = null
@@ -436,6 +477,11 @@ class TunnelPilotControllerTest {
         private var mode: RoutingMode = RoutingMode.ALL_APPS
         private var apps: Set<String> = emptySet()
         private var url: String = "http://127.0.0.1:8000"
+        private var preferredServerId: String? = null
+        private var preferredRegion: String? = null
+        private var assignedServerId: String? = null
+        private var deviceTier: String = "free"
+        private var adsConsent: Boolean = false
 
         override fun getRoutingMode(): RoutingMode = mode
         override fun setRoutingMode(mode: RoutingMode) {
@@ -450,6 +496,31 @@ class TunnelPilotControllerTest {
         override fun getControlPlaneUrl(): String = url
         override fun setControlPlaneUrl(url: String) {
             this.url = url
+        }
+
+        override fun getPreferredServerId(): String? = preferredServerId
+        override fun setPreferredServerId(serverId: String?) {
+            this.preferredServerId = serverId
+        }
+
+        override fun getPreferredRegion(): String? = preferredRegion
+        override fun setPreferredRegion(region: String?) {
+            this.preferredRegion = region
+        }
+
+        override fun getAssignedServerId(): String? = assignedServerId
+        override fun setAssignedServerId(serverId: String?) {
+            this.assignedServerId = serverId
+        }
+
+        override fun getDeviceTier(): String = deviceTier
+        override fun setDeviceTier(tier: String) {
+            this.deviceTier = tier
+        }
+
+        override fun getAdsConsent(): Boolean = adsConsent
+        override fun setAdsConsent(consented: Boolean) {
+            this.adsConsent = consented
         }
     }
 
@@ -511,12 +582,14 @@ class TunnelPilotControllerTest {
 
         var registerBehavior: ((String, String, String, String?) -> RegistrationResult)? = null
         var rotateBehavior: ((String, String, String, String) -> RotationResult)? = null
+        var migrateBehavior: ((String, String, String, String) -> MigrationResult)? = null
         var revokeBehavior: ((String, String) -> Boolean)? = null
         var listServersBehavior: (() -> List<RegisteredServer>)? = null
 
         fun resetDefaultBehaviors() {
             registerBehavior = null
             rotateBehavior = null
+            migrateBehavior = null
             revokeBehavior = null
             listServersBehavior = null
         }
@@ -526,6 +599,8 @@ class TunnelPilotControllerTest {
             publicKey: String,
             appVersion: String,
             deviceToken: String?,
+            preferredServerId: String?,
+            preferredRegion: String?,
         ): RegistrationResult {
             observedPublicKeys.add(publicKey)
             registerBehavior?.let { return it(deviceId, publicKey, appVersion, deviceToken) }
@@ -555,6 +630,23 @@ class TunnelPilotControllerTest {
             return RotationResult(
                 status = status,
                 deviceId = deviceId,
+                clientAddress = "10.67.0.2/32",
+                provisioned = true,
+                server = server,
+            )
+        }
+
+        override fun migrateDevice(
+            deviceId: String,
+            targetServerId: String,
+            appVersion: String,
+            deviceToken: String,
+        ): MigrationResult {
+            migrateBehavior?.let { return it(deviceId, targetServerId, appVersion, deviceToken) }
+            return MigrationResult(
+                status = "migrated",
+                deviceId = deviceId,
+                previousServerId = server.id,
                 clientAddress = "10.67.0.2/32",
                 provisioned = true,
                 server = server,

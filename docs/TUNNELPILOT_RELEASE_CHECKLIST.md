@@ -40,6 +40,7 @@ Statuses: `TODO`, `IN_PROGRESS`, `PASS`, `BLOCKED`, `NOT_APPLICABLE`.
 - [x] `PASS` — Decide which roadmap milestones are in first release vs later releases (documented in `README.md` under `Included in v0.2.0 Release Build` vs `Deferred to Post-v0.2.0 Milestones`, commit `6855153`).
 - [x] `PASS` — Smart Apps/Smart Auto deferred or implemented only with platform-supported design (deferred to M3.5 in `README.md`; v0.2.0 uses Android's public `VpnService.Builder.addAllowedApplication` via WireGuard `IncludedApplications`).
 - [x] `PASS` — Monetization/ads deferred from first release unless explicitly required (deferred to M4 in `README.md`; zero ad SDKs or trackers in v0.2.0 release artifacts).
+- [x] `PASS` — M2.4b Multi-server SQLite catalog, admin server CRUD with SSRF guards, server pinning on registration/rotation, device migration API/rollback, tombstone handling during reconciliation, and Android server/region selection with ADB CLI support (verified by 48 pytest tests and 22 Android unit tests).
 
 ## Phase 5 — final verification
 - [x] `PASS` — `.venv/bin/pytest server/tests -q` (`44 passed in 1.08s`).
@@ -74,3 +75,4 @@ Statuses: `TODO`, `IN_PROGRESS`, `PASS`, `BLOCKED`, `NOT_APPLICABLE`.
 | 2026-10-24 | `fe4e117` | Phase 2 backend/gateway hardening & DB restore tests | `.venv/bin/pytest server/tests -q` -> `44 passed in 1.08s`. |
 | 2026-10-24 | `6855153` | Phase 3 & 4 Android UX, diagnostics, network callback, release cleartext guard | `./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug :app:assembleRelease :app:bundleRelease` -> `BUILD SUCCESSFUL`. |
 | 2026-10-24 | `6855153` | Phase 5 release artifact inspection & physical device smoke test (`qs65vsrseqkrxs7x`) | `DebugCliProvider` & `usesCleartextTraffic` absent from Release APK/AAB; `probe-http https://example.com` returned `http_status=200` over `wg0` (`rx_bytes=49836, tx_bytes=21460`). |
+| 2026-10-24 | Pending | M2.4b Multi-server catalog, pinning, migration & Android server selector | `.venv/bin/pytest server/tests -q` -> `48 passed in 0.93s`; `./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug` -> `BUILD SUCCESSFUL`. |

@@ -14,6 +14,8 @@ interface ControlPlaneApi {
         publicKey: String,
         appVersion: String,
         deviceToken: String? = null,
+        preferredServerId: String? = null,
+        preferredRegion: String? = null,
     ): RegistrationResult
 
     fun rotateDevice(
@@ -22,6 +24,24 @@ interface ControlPlaneApi {
         appVersion: String,
         deviceToken: String,
     ): RotationResult
+
+    fun migrateDevice(
+        deviceId: String,
+        targetServerId: String,
+        appVersion: String,
+        deviceToken: String,
+    ): MigrationResult {
+        throw UnsupportedOperationException("Server migration is not implemented by this ControlPlaneApi")
+    }
+
+    fun updateDeviceTier(
+        deviceId: String,
+        tier: String,
+        purchaseToken: String? = null,
+        deviceToken: String,
+    ): TierUpdateResult {
+        throw UnsupportedOperationException("Tier update is not implemented by this ControlPlaneApi")
+    }
 
     fun revokeDevice(
         deviceId: String,
@@ -47,6 +67,8 @@ class ControlPlaneClient(
         publicKey: String,
         appVersion: String,
         deviceToken: String?,
+        preferredServerId: String?,
+        preferredRegion: String?,
     ): RegistrationResult {
         require(deviceId.isNotBlank()) { "Device ID is required" }
         require(publicKey.isNotBlank()) { "WireGuard public key is required" }
@@ -66,11 +88,17 @@ class ControlPlaneClient(
         }
 
         return try {
-            val payload = JSONObject()
+            val payloadJson = JSONObject()
                 .put("device_id", deviceId)
                 .put("client_public_key", publicKey)
                 .put("app_version", appVersion)
-                .toString()
+            if (!preferredServerId.isNullOrBlank()) {
+                payloadJson.put("server_id", preferredServerId.trim())
+            }
+            if (!preferredRegion.isNullOrBlank()) {
+                payloadJson.put("region", preferredRegion.trim())
+            }
+            val payload = payloadJson.toString()
 
             connection.outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
                 writer.write(payload)
@@ -128,6 +156,99 @@ class ControlPlaneClient(
             }
 
             parseRotation(responseBody)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    override fun migrateDevice(
+        deviceId: String,
+        targetServerId: String,
+        appVersion: String,
+        deviceToken: String,
+    ): MigrationResult {
+        require(deviceId.isNotBlank()) { "Device ID is required" }
+        require(targetServerId.isNotBlank()) { "Target server ID is required" }
+        require(appVersion.isNotBlank()) { "App version is required" }
+        require(deviceToken.isNotBlank()) { "Device token is required" }
+
+        val url = endpoint("/v1/devices/$deviceId/migrate")
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = connectTimeoutMs
+            readTimeout = readTimeoutMs
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("X-Device-Token", deviceToken)
+        }
+
+        return try {
+            val payload = JSONObject()
+                .put("target_server_id", targetServerId.trim())
+                .put("app_version", appVersion)
+                .toString()
+
+            connection.outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
+                writer.write(payload)
+            }
+
+            val responseCode = connection.responseCode
+            val responseBody = readResponseBody(connection, responseCode)
+            if (responseCode !in 200..299) {
+                throw ControlPlaneHttpException(responseCode, parseError(responseBody, responseCode))
+            }
+
+            parseMigration(responseBody)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    override fun updateDeviceTier(
+        deviceId: String,
+        tier: String,
+        purchaseToken: String?,
+        deviceToken: String,
+    ): TierUpdateResult {
+        require(deviceId.isNotBlank()) { "Device ID is required" }
+        require(tier == "free" || tier == "premium") { "Tier must be free or premium" }
+        require(deviceToken.isNotBlank()) { "Device token is required" }
+
+        val url = endpoint("/v1/devices/$deviceId/tier")
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = connectTimeoutMs
+            readTimeout = readTimeoutMs
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("X-Device-Token", deviceToken)
+        }
+
+        return try {
+            val payloadJson = JSONObject().put("tier", tier)
+            if (!purchaseToken.isNullOrBlank()) {
+                payloadJson.put("purchase_token", purchaseToken.trim())
+            }
+            val payload = payloadJson.toString()
+
+            connection.outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
+                writer.write(payload)
+            }
+
+            val responseCode = connection.responseCode
+            val responseBody = readResponseBody(connection, responseCode)
+            if (responseCode !in 200..299) {
+                throw ControlPlaneHttpException(responseCode, parseError(responseBody, responseCode))
+            }
+
+            val json = JSONObject(responseBody)
+            TierUpdateResult(
+                status = json.getString("status"),
+                deviceId = json.getString("device_id"),
+                tier = json.optString("tier", tier).trim().ifBlank { tier },
+            )
         } finally {
             connection.disconnect()
         }
@@ -256,6 +377,7 @@ class ControlPlaneClient(
             peerCount = peerCount,
             peerCapacity = peerCapacity,
             capacityRemaining = capacityRemaining,
+            tier = serverJson.optString("tier", "free").trim().ifBlank { "free" },
         )
     }
 
@@ -268,6 +390,21 @@ class ControlPlaneClient(
             clientAddress = json.getString("client_address"),
             provisioned = json.getBoolean("provisioned"),
             server = parseServer(serverJson),
+            tier = json.optString("tier", "free").trim().ifBlank { "free" },
+        )
+    }
+
+    private fun parseMigration(body: String): MigrationResult {
+        val json = JSONObject(body)
+        val serverJson = json.getJSONObject("server")
+        return MigrationResult(
+            status = json.getString("status"),
+            deviceId = json.getString("device_id"),
+            previousServerId = json.getString("previous_server_id"),
+            clientAddress = json.getString("client_address"),
+            provisioned = json.getBoolean("provisioned"),
+            server = parseServer(serverJson),
+            tier = json.optString("tier", "free").trim().ifBlank { "free" },
         )
     }
 
@@ -285,6 +422,7 @@ class ControlPlaneClient(
             provisioned = json.getBoolean("provisioned"),
             server = parseServer(serverJson),
             deviceToken = rawToken,
+            tier = json.optString("tier", "free").trim().ifBlank { "free" },
         )
     }
 
