@@ -9,6 +9,7 @@ import com.blawhi3929bd.tunnelpilot.data.InstalledAppsRepository
 import com.blawhi3929bd.tunnelpilot.data.SecureConfigStore
 import com.blawhi3929bd.tunnelpilot.provisioning.ControlPlaneClient
 import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
+import com.blawhi3929bd.tunnelpilot.provisioning.RegisteredServer
 import com.blawhi3929bd.tunnelpilot.provisioning.SecureIdentityStore
 import com.blawhi3929bd.tunnelpilot.provisioning.WireGuardConfigFactory
 import com.wireguard.android.backend.BackendException
@@ -79,6 +80,12 @@ class TunnelPilotController private constructor(context: Context) {
     private val _provisioningState = MutableStateFlow(loadInitialProvisioningState())
     val provisioningState: StateFlow<ProvisioningState> = _provisioningState.asStateFlow()
 
+    private val _servers = MutableStateFlow<List<RegisteredServer>>(emptyList())
+    val servers: StateFlow<List<RegisteredServer>> = _servers.asStateFlow()
+
+    private val _serversError = MutableStateFlow<String?>(null)
+    val serversError: StateFlow<String?> = _serversError.asStateFlow()
+
     private var statsJob: Job? = null
 
     init {
@@ -141,6 +148,26 @@ class TunnelPilotController private constructor(context: Context) {
         settingsStore.setControlPlaneUrl(url)
         if (_provisioningState.value is ProvisioningState.Error) {
             _provisioningState.value = loadInitialProvisioningState()
+        }
+        _serversError.value = null
+    }
+
+    fun refreshServers() {
+        scope.launch {
+            refreshServersNow()
+        }
+    }
+
+    suspend fun refreshServersNow(): Result<List<RegisteredServer>> = operationMutex.withLock {
+        runCatching {
+            val baseUrl = _controlPlaneUrl.value.trim()
+            require(baseUrl.isNotBlank()) { "Control plane URL is required" }
+            val fetched = ControlPlaneClient(baseUrl).listServers()
+            _servers.value = fetched
+            _serversError.value = null
+            fetched
+        }.onFailure { error ->
+            _serversError.value = error.message ?: "Unable to fetch server list"
         }
     }
 

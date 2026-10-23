@@ -168,4 +168,39 @@ class ControlPlaneClientTest {
         val client = ControlPlaneClient("http://127.0.0.1:$serverPort")
         client.revokeDevice("dev-1", "my-token")
     }
+
+    @Test
+    fun listServers_parsesHealthAndCapacity() {
+        server.createContext("/v1/servers") { exchange ->
+            val response = """
+                [
+                    {
+                        "id": "dev-1",
+                        "region": "dev",
+                        "hostname": "10.33.209.129",
+                        "public_key": "srv-pubkey",
+                        "port": 51820,
+                        "enabled": true,
+                        "health_status": "ok",
+                        "peer_count": 2,
+                        "peer_capacity": 240,
+                        "capacity_remaining": 238
+                    }
+                ]
+            """.trimIndent()
+            val bytes = response.toByteArray(Charsets.UTF_8)
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.write(bytes)
+            exchange.close()
+        }
+
+        val client = ControlPlaneClient("http://127.0.0.1:$serverPort")
+        val servers = client.listServers()
+        assertEquals(1, servers.size)
+        assertEquals("dev-1", servers[0].id)
+        assertEquals("ok", servers[0].healthStatus)
+        assertEquals(2, servers[0].peerCount)
+        assertEquals(240, servers[0].peerCapacity)
+        assertEquals(238, servers[0].capacityRemaining)
+    }
 }

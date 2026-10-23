@@ -15,6 +15,11 @@ TunnelPilot is an Android-first free WireGuard VPN client. The product goal is a
 - Control-plane provisioning that generates the client key locally and receives only server/public routing data.
 - Persistent SQLite storage for device allocation and SHA-256 device authentication tokens (M2.3a).
 - Authenticated WireGuard client key rotation with failure-safe rollback (M2.3b).
+- Fail-closed device revocation supporting both admin Bearer tokens and device self-revocation (`X-Device-Token`) with failure-safe gateway cleanup (M2.3c).
+- Gateway peer state reconciliation (`GET /v1/peers` + `POST /v1/servers/reconcile` and startup reconciliation) (M2.3d).
+- Local device identity reset & recovery in Android Setup UI (M2.3e).
+- Live gateway catalog & capacity inspection from the Android client (`GET /v1/servers`).
+- Debug-only remote ADB CLI (`DebugCliProvider` + `./scripts/tp-adb-cli.sh`) for automated end-to-end device testing over USB.
 - Failure-safe enrollment with automatic rollback if gateway provisioning fails.
 - TCP MSS clamping and NAT forwarding tooling for reliable high-speed data plane.
 - CI/build and unit-test foundation.
@@ -31,7 +36,7 @@ TunnelPilot is an Android-first free WireGuard VPN client. The product goal is a
 - [x] device registration using a locally generated client public key
 - [x] persistent SQLite state & device authentication tokens (M2.3a)
 - [x] authenticated client key rotation without exposing private keys (M2.3b)
-- [ ] administrative revocation, recovery & state reconciliation (M2.3c)
+- [x] administrative & self-service revocation, recovery & gateway state reconciliation (M2.3c / M2.3d / M2.3e)
 - [ ] multi-server inventory and region selection (M2.4)
 
 ### M3 — product polish

@@ -34,6 +34,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.collectAsState
 import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
+import com.blawhi3929bd.tunnelpilot.provisioning.RegisteredServer
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
@@ -82,6 +83,8 @@ private fun TunnelPilotScreen(
     val reconnectRequired by viewModel.reconnectRequired.collectAsState()
     val controlPlaneUrl by viewModel.controlPlaneUrl.collectAsState()
     val provisioningState by viewModel.provisioningState.collectAsState()
+    val servers by viewModel.servers.collectAsState()
+    val serversError by viewModel.serversError.collectAsState()
 
     Column(Modifier.fillMaxSize().padding(20.dp)) {
         Text("TunnelPilot", style = MaterialTheme.typography.headlineMedium)
@@ -122,9 +125,12 @@ private fun TunnelPilotScreen(
             "Setup" -> SetupSection(
                 controlPlaneUrl = controlPlaneUrl,
                 provisioningState = provisioningState,
+                servers = servers,
+                serversError = serversError,
                 onControlPlaneUrl = viewModel::setControlPlaneUrl,
                 onProvision = viewModel::provision,
                 onRotateKey = viewModel::rotateDeviceKey,
+                onRefreshServers = viewModel::refreshServers,
                 onResetIdentity = viewModel::resetIdentity,
             )
         }
@@ -247,9 +253,12 @@ private fun AppsSection(
 private fun SetupSection(
     controlPlaneUrl: String,
     provisioningState: ProvisioningState,
+    servers: List<RegisteredServer>,
+    serversError: String?,
     onControlPlaneUrl: (String) -> Unit,
     onProvision: () -> Unit,
     onRotateKey: () -> Unit,
+    onRefreshServers: () -> Unit,
     onResetIdentity: () -> Unit,
 ) {
     Column {
@@ -284,6 +293,13 @@ private fun SetupSection(
             Text("Rotate client key")
         }
         Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            modifier = Modifier.fillMaxWidth(),
+            onClick = onRefreshServers,
+        ) {
+            Text("Check server status")
+        }
+        Spacer(Modifier.height(8.dp))
         TextButton(
             modifier = Modifier.fillMaxWidth(),
             onClick = onResetIdentity,
@@ -303,6 +319,24 @@ private fun SetupSection(
                 Text(
                     provisioningState.message,
                     color = MaterialTheme.colorScheme.error,
+                )
+            }
+        }
+        if (serversError != null) {
+            Spacer(Modifier.height(8.dp))
+            Text(serversError, color = MaterialTheme.colorScheme.error)
+        } else if (servers.isNotEmpty()) {
+            Spacer(Modifier.height(12.dp))
+            Text("Gateway catalog", style = MaterialTheme.typography.titleMedium)
+            servers.forEach { server ->
+                val cap = if (server.peerCount != null && server.peerCapacity != null) {
+                    " (${server.peerCount}/${server.peerCapacity} peers)"
+                } else {
+                    ""
+                }
+                Text(
+                    "${server.id} [${server.region}] ${server.hostname}:${server.port} — ${server.healthStatus}$cap",
+                    style = MaterialTheme.typography.bodySmall,
                 )
             }
         }

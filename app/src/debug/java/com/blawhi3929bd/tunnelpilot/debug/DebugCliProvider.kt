@@ -79,6 +79,13 @@ class DebugCliProvider : ContentProvider() {
                 "reset_identity" -> {
                     controller.resetIdentityNow().map { newId -> "reset_identity new_device_id=$newId" }
                 }
+                "check_servers", "servers" -> {
+                    controller.refreshServersNow().map { list ->
+                        list.joinToString(";") { srv ->
+                            "${srv.id}:${srv.healthStatus}(${srv.peerCount ?: 0}/${srv.peerCapacity ?: 0})"
+                        }.ifEmpty { "no_servers" }
+                    }
+                }
                 else -> Result.failure(IllegalArgumentException("Unknown CLI method: $method"))
             }
 

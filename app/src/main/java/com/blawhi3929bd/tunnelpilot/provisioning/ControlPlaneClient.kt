@@ -1,5 +1,6 @@
 package com.blawhi3929bd.tunnelpilot.provisioning
 
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
@@ -131,6 +132,32 @@ class ControlPlaneClient(
         }
     }
 
+    fun listServers(): List<RegisteredServer> {
+        val url = endpoint("/v1/servers")
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = connectTimeoutMs
+            readTimeout = readTimeoutMs
+            setRequestProperty("Accept", "application/json")
+        }
+
+        return try {
+            val responseCode = connection.responseCode
+            val responseBody = readResponseBody(connection, responseCode)
+            if (responseCode !in 200..299) {
+                throw IllegalStateException(parseError(responseBody, responseCode))
+            }
+            val array = JSONArray(responseBody)
+            buildList(array.length()) {
+                for (i in 0 until array.length()) {
+                    add(parseServer(array.getJSONObject(i)))
+                }
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     private fun endpoint(path: String): URL {
         val normalized = baseUrl.trim().removeSuffix("/")
         require(normalized.isNotBlank()) { "Control plane URL is required" }
@@ -153,6 +180,18 @@ class ControlPlaneClient(
     }
 
 
+    private fun parseServer(serverJson: JSONObject): RegisteredServer = RegisteredServer(
+        id = serverJson.getString("id"),
+        region = serverJson.getString("region"),
+        hostname = serverJson.getString("hostname"),
+        publicKey = serverJson.getString("public_key"),
+        port = serverJson.getInt("port"),
+        healthStatus = serverJson.optString("health_status", "unknown").ifBlank { "unknown" },
+        peerCount = if (serverJson.has("peer_count") && !serverJson.isNull("peer_count")) serverJson.getInt("peer_count") else null,
+        peerCapacity = if (serverJson.has("peer_capacity") && !serverJson.isNull("peer_capacity")) serverJson.getInt("peer_capacity") else null,
+        capacityRemaining = if (serverJson.has("capacity_remaining") && !serverJson.isNull("capacity_remaining")) serverJson.getInt("capacity_remaining") else null,
+    )
+
     private fun parseRotation(body: String): RotationResult {
         val json = JSONObject(body)
         val serverJson = json.getJSONObject("server")
@@ -161,13 +200,7 @@ class ControlPlaneClient(
             deviceId = json.getString("device_id"),
             clientAddress = json.getString("client_address"),
             provisioned = json.getBoolean("provisioned"),
-            server = RegisteredServer(
-                id = serverJson.getString("id"),
-                region = serverJson.getString("region"),
-                hostname = serverJson.getString("hostname"),
-                publicKey = serverJson.getString("public_key"),
-                port = serverJson.getInt("port"),
-            ),
+            server = parseServer(serverJson),
         )
     }
 
@@ -178,13 +211,7 @@ class ControlPlaneClient(
             deviceId = json.getString("device_id"),
             clientAddress = json.getString("client_address"),
             provisioned = json.getBoolean("provisioned"),
-            server = RegisteredServer(
-                id = serverJson.getString("id"),
-                region = serverJson.getString("region"),
-                hostname = serverJson.getString("hostname"),
-                publicKey = serverJson.getString("public_key"),
-                port = serverJson.getInt("port"),
-            ),
+            server = parseServer(serverJson),
             deviceToken = json.optString("device_token").ifBlank { null },
         )
     }

@@ -5,6 +5,7 @@ import android.content.Intent
 import androidx.lifecycle.AndroidViewModel
 import com.blawhi3929bd.tunnelpilot.data.InstalledApp
 import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
+import com.blawhi3929bd.tunnelpilot.provisioning.RegisteredServer
 import kotlinx.coroutines.flow.StateFlow
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
@@ -18,6 +19,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val reconnectRequired: StateFlow<Boolean> = controller.reconnectRequired
     val controlPlaneUrl: StateFlow<String> = controller.controlPlaneUrl
     val provisioningState: StateFlow<ProvisioningState> = controller.provisioningState
+    val servers: StateFlow<List<RegisteredServer>> = controller.servers
+    val serversError: StateFlow<String?> = controller.serversError
 
     fun requiredVpnPermissionIntent(): Intent? = controller.requiredVpnPermissionIntent()
 
@@ -32,6 +35,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun provision() = controller.provision()
 
     fun rotateDeviceKey() = controller.rotateDeviceKey()
+
+    fun refreshServers() = controller.refreshServers()
 
     fun resetIdentity() = controller.resetIdentity()
 

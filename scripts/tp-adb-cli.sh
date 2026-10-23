@@ -8,6 +8,7 @@ ensure_adb() {
   if ! adb get-state >/dev/null 2>&1; then
     adb kill-server >/dev/null 2>&1 || true
     ADB_LIBUSB=0 adb start-server >/dev/null 2>&1
+    sleep 1
   fi
 }
 
@@ -29,6 +30,11 @@ cmd="${1:-status}"
 shift || true
 
 case "$cmd" in
+  install)
+    ensure_adb
+    adb install -r "${1:-app/build/outputs/apk/debug/app-debug.apk}"
+    adb reverse tcp:8000 tcp:8000 || true
+    ;;
   status)
     call_cli "status"
     ;;
@@ -62,12 +68,17 @@ case "$cmd" in
   reset-identity|reset_identity)
     call_cli "reset_identity"
     ;;
+  servers|check-servers|check_servers)
+    call_cli "check_servers"
+    ;;
   help|-h|--help)
     cat <<EOF
 Usage: $0 <command> [arg]
 
 Commands:
+  install [apk_path]             Install debug APK (auto-fixing ADB_LIBUSB=0) and set adb reverse tcp:8000
   status                         Show current VPN, routing, and provisioning status
+  servers                        Query Control Plane /v1/servers health and capacity from the phone
   set-url <url>                  Update Control Plane URL
   provision [url]                Provision device (optionally setting Control Plane URL first)
   rotate-key                     Generate a new WireGuard keypair and rotate it on the server

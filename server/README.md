@@ -11,9 +11,10 @@ The control plane never receives a client private key and never needs the gatewa
 
 - `GET /healthz` — liveness.
 - `GET /v1/servers` — enabled WireGuard gateways with live health/capacity data.
+- `POST /v1/servers/reconcile` & `POST /v1/servers/{server_id}/reconcile` — reconciles SQLite-provisioned device peers with the live WireGuard interface on the gateway (restoring missing peers and removing orphaned peers). Also runs best-effort on Control Plane startup.
 - `POST /v1/devices` — first registration allocates a `/32`, issues a device token, and provisions the gateway peer. Existing devices must authenticate with `X-Device-Token`; registration is idempotent and repairs a missing gateway peer.
 - `POST /v1/devices/{device_id}/rotate` — authenticated WireGuard public-key rotation while preserving the device ID, VPN address, server assignment, and device token.
-- `DELETE /v1/devices/{device_id}` — administrative revocation using the control-plane Bearer token; removes the gateway peer and deletes the device state.
+- `DELETE /v1/devices/{device_id}` — fail-closed revocation requiring either the admin `Authorization: Bearer <token>` or the device's `X-Device-Token`; removes the gateway peer first and retains the SQLite record on gateway failure unless `?force=true` is specified.
 
 ### Environment
 
@@ -46,6 +47,7 @@ uvicorn server.gateway_agent.app:app --host 127.0.0.1 --port 8787
 The mutation API is always authenticated. The agent exposes:
 
 - `GET /healthz`
+- `GET /v1/peers`
 - `POST /v1/peers`
 - `DELETE /v1/peers`
 
@@ -61,6 +63,7 @@ For local development and testing:
 - `./scripts/start-gateway-agent.sh`: generates a temporary gateway token and starts the Gateway Agent on `127.0.0.1:8787`.
 - `./scripts/start-control-plane.sh`: reads the gateway token and server public key, detects the gateway endpoint IP, and starts the Control Plane on `0.0.0.0:8000`.
 - `./scripts/fix-gateway-forwarding.sh`: configures `sysctl` IP forwarding, NAT `MASQUERADE`, and TCP MSS clamping (`--clamp-mss-to-pmtu`) to prevent packet drops on HTTPS traffic.
+- `./scripts/tp-adb-cli.sh`: remote CLI wrapper over ADB (`status`, `servers`, `provision`, `rotate-key`, `connect`, `disconnect`, `set-mode`, `set-apps`, `apply-routing`, `revoke`, `reset-identity`) for automated testing of debug builds on a connected Android device.
 
 ## Tests
 

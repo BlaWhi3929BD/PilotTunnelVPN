@@ -6,6 +6,10 @@ data class RegisteredServer(
     val hostname: String,
     val publicKey: String,
     val port: Int,
+    val healthStatus: String = "unknown",
+    val peerCount: Int? = null,
+    val peerCapacity: Int? = null,
+    val capacityRemaining: Int? = null,
 )
 
 data class RotationResult(
