@@ -307,6 +307,93 @@ class TunnelPilotControllerTest {
         assertFalse(controlPlane.observedPublicKeys.contains(keyBeforeConflict))
     }
 
+    @Test
+    fun serverCatalogRefresh_handlesSuccessEmptyAndStaleErrorStates() = runBlocking {
+        val controller = createController()
+        assertFalse(controller.serversLoaded.value)
+        assertFalse(controller.serversLoading.value)
+
+        // 1. Successful catalog load
+        val firstRefresh = controller.refreshServersNow()
+        assertTrue(firstRefresh.isSuccess)
+        assertTrue(controller.serversLoaded.value)
+        assertFalse(controller.serversLoading.value)
+        assertNull(controller.serversError.value)
+        assertEquals(1, controller.servers.value.size)
+        assertEquals("srv-1", controller.servers.value[0].id)
+
+        // 2. Subsequent network error preserves cached server list while reporting serversError
+        controlPlane.listServersBehavior = {
+            throw ConnectException("Control plane unreachable")
+        }
+        val failedRefresh = controller.refreshServersNow()
+        assertTrue(failedRefresh.isFailure)
+        assertFalse(controller.serversLoading.value)
+        assertEquals(1, controller.servers.value.size)
+        assertTrue(controller.serversError.value!!.contains("Control plane unreachable"))
+
+        // 3. Empty catalog response clears list and clears error
+        controlPlane.listServersBehavior = { emptyList() }
+        val emptyRefresh = controller.refreshServersNow()
+        assertTrue(emptyRefresh.isSuccess)
+        assertTrue(controller.serversLoaded.value)
+        assertTrue(controller.servers.value.isEmpty())
+        assertNull(controller.serversError.value)
+    }
+
+    @Test
+    fun revokeAndReset_preserveCredentialsOnServerFailureAndSupportExplicitForceLocal() = runBlocking {
+        val controller = createController()
+        assertTrue(controller.provisionNow().isSuccess)
+        assertTrue(controller.hasDeviceToken.value)
+        assertTrue(controller.configPresent.value)
+        val originalDeviceId = identityStore.getOrCreateDeviceId()
+
+        // 1. Server revoke fails -> clearConfigNow(forceLocal=false) and resetIdentityNow(forceLocal=false) preserve credentials
+        controlPlane.revokeBehavior = { _, _ ->
+            throw ConnectException("Server offline during revoke")
+        }
+        val failedClear = controller.clearConfigNow(forceLocal = false)
+        assertTrue(failedClear.isFailure)
+        assertTrue(controller.configPresent.value)
+        assertTrue(controller.hasDeviceToken.value)
+        assertEquals("Provisioned", controller.statusSnapshot().provisioningStatus)
+
+        val failedReset = controller.resetIdentityNow(forceLocal = false)
+        assertTrue(failedReset.isFailure)
+        assertTrue(controller.configPresent.value)
+        assertTrue(controller.hasDeviceToken.value)
+        assertEquals(originalDeviceId, identityStore.getOrCreateDeviceId())
+
+        // 2. Explicit emergency local reset (forceLocal=true) clears local identity & config even when server is offline
+        val forcedReset = controller.resetIdentityNow(forceLocal = true)
+        assertTrue(forcedReset.isSuccess)
+        assertFalse(controller.configPresent.value)
+        assertFalse(controller.hasDeviceToken.value)
+        assertNotEquals(originalDeviceId, forcedReset.getOrThrow())
+        assertEquals("NotConfigured", controller.statusSnapshot().provisioningStatus)
+    }
+
+    @Test
+    fun reconnectAndRefreshState_synchronizeWithBackendAndSelection() = runBlocking {
+        val controller = createController()
+        assertTrue(controller.provisionNow().isSuccess)
+        controller.toggleApp("com.example.allowed")
+        assertEquals(setOf("com.example.allowed"), controller.selectedApps.value)
+        controller.clearSelectedApps()
+        assertTrue(controller.selectedApps.value.isEmpty())
+
+        assertTrue(controller.connectNow().isSuccess)
+        assertEquals("Connected", controller.statusSnapshot().vpnState)
+        assertTrue(controller.reconnectNow().isSuccess)
+        assertEquals("Connected", controller.statusSnapshot().vpnState)
+
+        // Simulate external tunnel drop (e.g., OS revoke) and verify refreshState() reconciles state
+        backend.disconnect()
+        controller.refreshState()
+        assertEquals("Disconnected", controller.statusSnapshot().vpnState)
+    }
+
     private class FakeTunnelBackend : TunnelBackend {
         private var state: Tunnel.State = Tunnel.State.DOWN
         var lastConnectedConfig: String? = null
@@ -424,10 +511,14 @@ class TunnelPilotControllerTest {
 
         var registerBehavior: ((String, String, String, String?) -> RegistrationResult)? = null
         var rotateBehavior: ((String, String, String, String) -> RotationResult)? = null
+        var revokeBehavior: ((String, String) -> Boolean)? = null
+        var listServersBehavior: (() -> List<RegisteredServer>)? = null
 
         fun resetDefaultBehaviors() {
             registerBehavior = null
             rotateBehavior = null
+            revokeBehavior = null
+            listServersBehavior = null
         }
 
         override fun registerDevice(
@@ -470,8 +561,14 @@ class TunnelPilotControllerTest {
             )
         }
 
-        override fun revokeDevice(deviceId: String, deviceToken: String): Boolean = true
+        override fun revokeDevice(deviceId: String, deviceToken: String): Boolean {
+            revokeBehavior?.let { return it(deviceId, deviceToken) }
+            return true
+        }
 
-        override fun listServers(): List<RegisteredServer> = listOf(server)
+        override fun listServers(): List<RegisteredServer> {
+            listServersBehavior?.let { return it() }
+            return listOf(server)
+        }
     }
 }

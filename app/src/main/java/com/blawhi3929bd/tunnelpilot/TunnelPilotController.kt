@@ -58,7 +58,9 @@ class TunnelPilotController internal constructor(
     private val settingsStore: SettingsStorage,
     private val identityStore: IdentityStorage,
     private val installedAppsRepository: InstalledAppsProvider,
-    private val controlPlaneClientFactory: (String) -> ControlPlaneApi = { ControlPlaneClient(it) },
+    private val controlPlaneClientFactory: (String) -> ControlPlaneApi = {
+        ControlPlaneClient(it, allowCleartext = BuildConfig.DEBUG)
+    },
     private val vpnPermissionChecker: () -> Intent? = { null },
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     startBackgroundTasks: Boolean = true,
@@ -69,7 +71,7 @@ class TunnelPilotController internal constructor(
         settingsStore = AppSettingsStore(context.applicationContext),
         identityStore = SecureIdentityStore(context.applicationContext),
         installedAppsRepository = InstalledAppsRepository(context.applicationContext),
-        controlPlaneClientFactory = { ControlPlaneClient(it) },
+        controlPlaneClientFactory = { ControlPlaneClient(it, allowCleartext = BuildConfig.DEBUG) },
         vpnPermissionChecker = { VpnService.prepare(context.applicationContext) },
     )
 
@@ -106,8 +108,17 @@ class TunnelPilotController internal constructor(
     private val _serversLoaded = MutableStateFlow(false)
     val serversLoaded: StateFlow<Boolean> = _serversLoaded.asStateFlow()
 
+    private val _serversLoading = MutableStateFlow(false)
+    val serversLoading: StateFlow<Boolean> = _serversLoading.asStateFlow()
+
     private val _serversError = MutableStateFlow<String?>(null)
     val serversError: StateFlow<String?> = _serversError.asStateFlow()
+
+    private val _vpnPermissionRequired = MutableStateFlow(vpnPermissionChecker() != null)
+    val vpnPermissionRequired: StateFlow<Boolean> = _vpnPermissionRequired.asStateFlow()
+
+    private val _hasDeviceToken = MutableStateFlow(identityStore.loadDeviceToken() != null)
+    val hasDeviceToken: StateFlow<Boolean> = _hasDeviceToken.asStateFlow()
 
     private var statsJob: Job? = null
 
@@ -153,7 +164,15 @@ class TunnelPilotController internal constructor(
         }
     }
 
-    fun requiredVpnPermissionIntent(): Intent? = vpnPermissionChecker()
+    fun requiredVpnPermissionIntent(): Intent? = vpnPermissionChecker().also {
+        _vpnPermissionRequired.value = it != null
+    }
+
+    fun refreshState() {
+        syncBackendState()
+        _vpnPermissionRequired.value = vpnPermissionChecker() != null
+        _hasDeviceToken.value = identityStore.loadDeviceToken() != null
+    }
 
     fun refreshInstalledApps() {
         scope.launch(Dispatchers.Default) {
@@ -175,6 +194,13 @@ class TunnelPilotController internal constructor(
         }
         _selectedApps.value = updated
         settingsStore.setSelectedApps(updated)
+        markRoutingChanged()
+    }
+
+    fun clearSelectedApps() {
+        if (_selectedApps.value.isEmpty()) return
+        _selectedApps.value = emptySet()
+        settingsStore.setSelectedApps(emptySet())
         markRoutingChanged()
     }
 
@@ -208,16 +234,21 @@ class TunnelPilotController internal constructor(
     }
 
     suspend fun refreshServersNow(): Result<List<RegisteredServer>> = catalogMutex.withLock {
-        runCatching {
-            val baseUrl = _controlPlaneUrl.value.trim()
-            require(baseUrl.isNotBlank()) { "Control plane URL is required" }
-            val fetched = controlPlaneClientFactory(baseUrl).listServers()
-            _servers.value = fetched
-            _serversLoaded.value = true
-            _serversError.value = null
-            fetched
-        }.onFailure { error ->
-            _serversError.value = error.message ?: "Unable to fetch server list"
+        _serversLoading.value = true
+        try {
+            runCatching {
+                val baseUrl = _controlPlaneUrl.value.trim()
+                require(baseUrl.isNotBlank()) { "Control plane URL is required" }
+                val fetched = controlPlaneClientFactory(baseUrl).listServers()
+                _servers.value = fetched
+                _serversLoaded.value = true
+                _serversError.value = null
+                fetched
+            }.onFailure { error ->
+                _serversError.value = error.message ?: "Unable to fetch server list"
+            }
+        } finally {
+            _serversLoading.value = false
         }
     }
 
@@ -294,6 +325,7 @@ class TunnelPilotController internal constructor(
             }
             registration.deviceToken?.let(identityStore::saveDeviceToken)
             identityStore.clearPendingPrivateKey()
+            _hasDeviceToken.value = identityStore.loadDeviceToken() != null
 
             val config = WireGuardConfigFactory.create(
                 privateKey = activePrivateKey,
@@ -423,9 +455,9 @@ class TunnelPilotController internal constructor(
         _configPresent.value = true
     }
 
-    fun clearConfig() {
+    fun clearConfig(forceLocal: Boolean = false) {
         scope.launch {
-            clearConfigNow(forceLocal = false)
+            clearConfigNow(forceLocal = forceLocal)
         }
     }
 
@@ -454,6 +486,7 @@ class TunnelPilotController internal constructor(
             configStore.clear()
             identityStore.clearDeviceToken()
             identityStore.clearPrivateKey()
+            _hasDeviceToken.value = false
             _configPresent.value = false
             _reconnectRequired.value = false
             _provisioningState.value = ProvisioningState.NotConfigured
@@ -464,9 +497,9 @@ class TunnelPilotController internal constructor(
         }
     }
 
-    fun resetIdentity() {
+    fun resetIdentity(forceLocal: Boolean = false) {
         scope.launch {
-            resetIdentityNow(forceLocal = false)
+            resetIdentityNow(forceLocal = forceLocal)
         }
     }
 
@@ -496,6 +529,7 @@ class TunnelPilotController internal constructor(
             }
             configStore.clear()
             val newDeviceId = identityStore.resetIdentity()
+            _hasDeviceToken.value = false
             _configPresent.value = false
             _reconnectRequired.value = false
             _provisioningState.value = ProvisioningState.NotConfigured
@@ -541,6 +575,36 @@ class TunnelPilotController internal constructor(
 
     suspend fun disconnectNow(): Result<Unit> = operationMutex.withLock {
         disconnectAndWait()
+    }
+
+    fun reconnect() {
+        scope.launch {
+            reconnectNow()
+        }
+    }
+
+    suspend fun reconnectNow(): Result<Unit> = operationMutex.withLock {
+        syncBackendState()
+        if (_state.value.isActive() || manager.currentState() == Tunnel.State.UP) {
+            val disconnected = disconnectAndWait()
+            if (disconnected.isFailure) return@withLock disconnected
+        }
+        if (!_configPresent.value) {
+            val msg = "Import a WireGuard configuration first"
+            setError(msg)
+            return@withLock Result.failure(IllegalStateException(msg))
+        }
+        if (_routingMode.value == RoutingMode.SELECTED_APPS && _selectedApps.value.isEmpty()) {
+            val msg = "Select at least one app for Selected apps mode"
+            setError(msg)
+            return@withLock Result.failure(IllegalStateException(msg))
+        }
+        if (requiredVpnPermissionIntent() != null) {
+            val msg = "Android VPN permission is required"
+            setError(msg)
+            return@withLock Result.failure(IllegalStateException(msg))
+        }
+        performConnect()
     }
 
     fun applyRoutingChanges() {

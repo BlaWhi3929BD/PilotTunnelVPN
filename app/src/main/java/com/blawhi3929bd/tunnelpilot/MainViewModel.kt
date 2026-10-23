@@ -21,15 +21,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val provisioningState: StateFlow<ProvisioningState> = controller.provisioningState
     val servers: StateFlow<List<RegisteredServer>> = controller.servers
     val serversLoaded: StateFlow<Boolean> = controller.serversLoaded
+    val serversLoading: StateFlow<Boolean> = controller.serversLoading
     val serversError: StateFlow<String?> = controller.serversError
+    val vpnPermissionRequired: StateFlow<Boolean> = controller.vpnPermissionRequired
+    val hasDeviceToken: StateFlow<Boolean> = controller.hasDeviceToken
 
     fun requiredVpnPermissionIntent(): Intent? = controller.requiredVpnPermissionIntent()
+
+    fun refreshState() = controller.refreshState()
 
     fun refreshInstalledApps() = controller.refreshInstalledApps()
 
     fun setRoutingMode(mode: RoutingMode) = controller.setRoutingMode(mode)
 
     fun toggleApp(packageName: String) = controller.toggleApp(packageName)
+
+    fun clearSelectedApps() = controller.clearSelectedApps()
 
     fun setControlPlaneUrl(url: String) = controller.setControlPlaneUrl(url)
 
@@ -39,15 +46,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun refreshServers() = controller.refreshServers()
 
-    fun resetIdentity() = controller.resetIdentity()
+    fun resetIdentity(forceLocal: Boolean = false) = controller.resetIdentity(forceLocal)
 
     fun setConfig(rawConfig: String): Result<Unit> = controller.setConfig(rawConfig)
 
-    fun clearConfig() = controller.clearConfig()
+    fun clearConfig(forceLocal: Boolean = false) = controller.clearConfig(forceLocal)
 
     fun connect() = controller.connect()
 
     fun disconnect() = controller.disconnect()
+
+    fun reconnect() = controller.reconnect()
 
     fun applyRoutingChanges() = controller.applyRoutingChanges()
 }

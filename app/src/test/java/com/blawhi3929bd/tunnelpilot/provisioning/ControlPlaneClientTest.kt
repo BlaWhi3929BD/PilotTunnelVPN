@@ -343,4 +343,24 @@ class ControlPlaneClientTest {
         assertFalse(releaseContent.contains("DebugCliProvider"))
         assertFalse(releaseContent.contains("usesCleartextTraffic"))
     }
+
+    @Test
+    fun releaseCleartextPolicy_rejectsNonLoopbackHttpAndAllowsLoopback() {
+        val remoteHttpClient = ControlPlaneClient("http://203.0.113.10:8000", allowCleartext = false)
+        try {
+            remoteHttpClient.listServers()
+            fail("Expected IllegalArgumentException for remote http:// URL when allowCleartext=false")
+        } catch (e: IllegalArgumentException) {
+            assertTrue(e.message!!.contains("HTTPS is required"))
+        }
+
+        server.createContext("/v1/servers") { exchange ->
+            val bytes = "[]".toByteArray(Charsets.UTF_8)
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.write(bytes)
+            exchange.close()
+        }
+        val loopbackClient = ControlPlaneClient("http://127.0.0.1:$serverPort", allowCleartext = false)
+        assertTrue(loopbackClient.listServers().isEmpty())
+    }
 }

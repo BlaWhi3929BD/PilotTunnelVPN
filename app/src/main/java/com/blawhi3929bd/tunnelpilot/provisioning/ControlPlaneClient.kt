@@ -40,6 +40,7 @@ class ControlPlaneClient(
     private val baseUrl: String,
     private val connectTimeoutMs: Int = 8_000,
     private val readTimeoutMs: Int = 8_000,
+    private val allowCleartext: Boolean = true,
 ) : ControlPlaneApi {
     override fun registerDevice(
         deviceId: String,
@@ -192,8 +193,13 @@ class ControlPlaneClient(
         val normalized = baseUrl.trim().removeSuffix("/")
         require(normalized.isNotBlank()) { "Control plane URL is required" }
         val parsed = URI(normalized)
-        require(parsed.scheme == "http" || parsed.scheme == "https") {
+        val scheme = parsed.scheme?.lowercase()
+        require(scheme == "http" || scheme == "https") {
             "Control plane URL must use http or https"
+        }
+        val host = parsed.host?.lowercase().orEmpty()
+        if (!allowCleartext && scheme == "http" && host !in LOOPBACK_HOSTS) {
+            throw IllegalArgumentException("HTTPS is required for Control Plane URL in release builds")
         }
         return URI("$normalized$path").toURL()
     }
@@ -280,5 +286,9 @@ class ControlPlaneClient(
             server = parseServer(serverJson),
             deviceToken = rawToken,
         )
+    }
+
+    private companion object {
+        val LOOPBACK_HOSTS = setOf("127.0.0.1", "localhost", "::1", "[::1]")
     }
 }

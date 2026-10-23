@@ -1,6 +1,7 @@
 package com.blawhi3929bd.tunnelpilot
 
-import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -16,7 +17,9 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.Checkbox
@@ -28,31 +31,54 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.collectAsState
-import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
-import com.blawhi3929bd.tunnelpilot.provisioning.RegisteredServer
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
+import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
+import com.blawhi3929bd.tunnelpilot.provisioning.RegisteredServer
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     private val viewModel by viewModels<MainViewModel>()
+    private var connectivityManager: ConnectivityManager? = null
+
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onAvailable(network: Network) {
+            runOnUiThread { viewModel.refreshState() }
+        }
+
+        override fun onLost(network: Network) {
+            runOnUiThread { viewModel.refreshState() }
+        }
+    }
 
     private val vpnPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.StartActivityForResult(),
     ) {
+        viewModel.refreshState()
         if (it.resultCode == RESULT_OK) viewModel.connect()
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        connectivityManager = getSystemService(ConnectivityManager::class.java)
+        try {
+            if (checkSelfPermission(android.Manifest.permission.ACCESS_NETWORK_STATE) ==
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                connectivityManager?.registerDefaultNetworkCallback(networkCallback)
+            }
+        } catch (_: Exception) {
+            // Ignore if network callback registration is unavailable on restricted ROMs.
+        }
         setContent {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) {
@@ -67,6 +93,19 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    override fun onResume() {
+        super.onResume()
+        viewModel.refreshState()
+    }
+
+    override fun onDestroy() {
+        try {
+            connectivityManager?.unregisterNetworkCallback(networkCallback)
+        } catch (_: Exception) {
+        }
+        super.onDestroy()
+    }
 }
 
 @Composable
@@ -74,7 +113,7 @@ private fun TunnelPilotScreen(
     viewModel: MainViewModel,
     requestVpnPermission: () -> Unit,
 ) {
-    var section by remember { mutableStateOf("VPN") }
+    var section by rememberSaveable { mutableStateOf("VPN") }
     val state by viewModel.state.collectAsState()
     val configPresent by viewModel.configPresent.collectAsState()
     val apps by viewModel.installedApps.collectAsState()
@@ -85,7 +124,10 @@ private fun TunnelPilotScreen(
     val provisioningState by viewModel.provisioningState.collectAsState()
     val servers by viewModel.servers.collectAsState()
     val serversLoaded by viewModel.serversLoaded.collectAsState()
+    val serversLoading by viewModel.serversLoading.collectAsState()
     val serversError by viewModel.serversError.collectAsState()
+    val vpnPermissionRequired by viewModel.vpnPermissionRequired.collectAsState()
+    val hasDeviceToken by viewModel.hasDeviceToken.collectAsState()
 
     Column(Modifier.fillMaxSize().padding(20.dp)) {
         Text("TunnelPilot", style = MaterialTheme.typography.headlineMedium)
@@ -104,36 +146,49 @@ private fun TunnelPilotScreen(
             "VPN" -> VpnSection(
                 state = state,
                 configPresent = configPresent,
+                provisioningState = provisioningState,
+                vpnPermissionRequired = vpnPermissionRequired,
                 routingMode = routingMode,
                 selectedCount = selectedApps.size,
                 reconnectRequired = reconnectRequired,
                 onConnect = requestVpnPermission,
                 onDisconnect = viewModel::disconnect,
+                onReconnect = viewModel::reconnect,
                 onApplyRouting = viewModel::applyRoutingChanges,
                 onRoutingMode = viewModel::setRoutingMode,
+                onOpenSetup = { section = "Setup" },
+                onOpenConfig = { section = "Config" },
+                onOpenApps = { section = "Apps" },
             )
             "Apps" -> AppsSection(
                 apps = apps,
                 selectedApps = selectedApps,
+                routingMode = routingMode,
                 onToggle = viewModel::toggleApp,
+                onClearSelection = viewModel::clearSelectedApps,
                 onRefresh = viewModel::refreshInstalledApps,
             )
             "Config" -> ConfigSection(
                 configPresent = configPresent,
+                provisioningState = provisioningState,
                 onSave = viewModel::setConfig,
-                onClear = viewModel::clearConfig,
+                onClear = { viewModel.clearConfig(forceLocal = false) },
+                onForceClearLocal = { viewModel.clearConfig(forceLocal = true) },
             )
             "Setup" -> SetupSection(
                 controlPlaneUrl = controlPlaneUrl,
                 provisioningState = provisioningState,
+                hasDeviceToken = hasDeviceToken,
                 servers = servers,
                 serversLoaded = serversLoaded,
+                serversLoading = serversLoading,
                 serversError = serversError,
                 onControlPlaneUrl = viewModel::setControlPlaneUrl,
                 onProvision = viewModel::provision,
                 onRotateKey = viewModel::rotateDeviceKey,
                 onRefreshServers = viewModel::refreshServers,
-                onResetIdentity = viewModel::resetIdentity,
+                onResetIdentity = { viewModel.resetIdentity(forceLocal = false) },
+                onForceResetLocalIdentity = { viewModel.resetIdentity(forceLocal = true) },
             )
         }
     }
@@ -143,67 +198,139 @@ private fun TunnelPilotScreen(
 private fun VpnSection(
     state: VpnState,
     configPresent: Boolean,
+    provisioningState: ProvisioningState,
+    vpnPermissionRequired: Boolean,
     routingMode: RoutingMode,
     selectedCount: Int,
     reconnectRequired: Boolean,
     onConnect: () -> Unit,
     onDisconnect: () -> Unit,
+    onReconnect: () -> Unit,
     onApplyRouting: () -> Unit,
     onRoutingMode: (RoutingMode) -> Unit,
+    onOpenSetup: () -> Unit,
+    onOpenConfig: () -> Unit,
+    onOpenApps: () -> Unit,
 ) {
-    Card(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(18.dp)) {
-            Text(stateLabel(state), style = MaterialTheme.typography.titleLarge)
-            Spacer(Modifier.height(6.dp))
-            Text(routingDescription(routingMode, selectedCount))
-            Spacer(Modifier.height(16.dp))
-
-            Text("Routing mode", style = MaterialTheme.typography.titleMedium)
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                if (routingMode == RoutingMode.ALL_APPS) {
-                    Button(onClick = {}) { Text("All apps") }
-                } else {
-                    OutlinedButton(onClick = { onRoutingMode(RoutingMode.ALL_APPS) }) { Text("All apps") }
-                }
-                if (routingMode == RoutingMode.SELECTED_APPS) {
-                    Button(onClick = {}) { Text("Selected apps") }
-                } else {
-                    OutlinedButton(onClick = { onRoutingMode(RoutingMode.SELECTED_APPS) }) { Text("Selected apps") }
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+    ) {
+        if (!configPresent) {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(18.dp)) {
+                    Text("Welcome to TunnelPilot", style = MaterialTheme.typography.titleMedium)
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        "No WireGuard configuration is installed yet. Use automatic Setup to provision this device " +
+                            "with a Control Plane server, or import a configuration manually.",
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = onOpenSetup) { Text("Open Setup") }
+                        OutlinedButton(onClick = onOpenConfig) { Text("Import Config") }
+                    }
                 }
             }
-            Spacer(Modifier.height(16.dp))
+            Spacer(Modifier.height(12.dp))
+        }
 
-            Button(
-                onClick = onConnect,
-                modifier = Modifier.fillMaxWidth(),
-                enabled = configPresent && !state.isActive(),
-            ) { Text("Connect") }
-            Spacer(Modifier.height(8.dp))
-            OutlinedButton(
-                onClick = onDisconnect,
-                modifier = Modifier.fillMaxWidth(),
-                enabled = state is VpnState.Connected || state is VpnState.Connecting,
-            ) { Text("Disconnect") }
-
-            if (reconnectRequired) {
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(18.dp)) {
+                Text(stateLabel(state), style = MaterialTheme.typography.titleLarge)
+                Spacer(Modifier.height(6.dp))
+                Text(routingDescription(routingMode, selectedCount))
                 Spacer(Modifier.height(8.dp))
-                Button(
-                    onClick = onApplyRouting,
-                    modifier = Modifier.fillMaxWidth(),
-                ) {
-                    Text("Reconnect with new routing")
-                }
-            }
+                Text(
+                    text = provisioningSummary(provisioningState, configPresent),
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Text(
+                    text = if (vpnPermissionRequired) {
+                        "VPN permission: required (Android will prompt on Connect)"
+                    } else {
+                        "VPN permission: granted"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Spacer(Modifier.height(16.dp))
 
-            if (state is VpnState.Connected) {
-                Spacer(Modifier.height(12.dp))
-                Text("Received: ${formatBytes(state.rxBytes)}")
-                Text("Sent: ${formatBytes(state.txBytes)}")
-            }
-            if (state is VpnState.Error) {
-                Spacer(Modifier.height(10.dp))
-                Text(state.message, color = MaterialTheme.colorScheme.error)
+                Text("Routing mode", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (routingMode == RoutingMode.ALL_APPS) {
+                        Button(onClick = {}) { Text("All apps") }
+                    } else {
+                        OutlinedButton(onClick = { onRoutingMode(RoutingMode.ALL_APPS) }) { Text("All apps") }
+                    }
+                    if (routingMode == RoutingMode.SELECTED_APPS) {
+                        Button(onClick = {}) { Text("Selected apps") }
+                    } else {
+                        OutlinedButton(onClick = { onRoutingMode(RoutingMode.SELECTED_APPS) }) { Text("Selected apps") }
+                    }
+                }
+                if (routingMode == RoutingMode.SELECTED_APPS && selectedCount == 0) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "Selected-apps mode requires at least one app. Choose apps in the Apps tab before connecting.",
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(4.dp))
+                    TextButton(onClick = onOpenApps) { Text("Select apps") }
+                }
+                Spacer(Modifier.height(16.dp))
+
+                Button(
+                    onClick = onConnect,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = configPresent && !state.isActive(),
+                ) {
+                    Text(if (vpnPermissionRequired) "Grant permission & Connect" else "Connect")
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onDisconnect,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = state is VpnState.Connected || state is VpnState.Connecting,
+                ) { Text("Disconnect") }
+
+                if (state is VpnState.Connected || state is VpnState.Error) {
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = onReconnect,
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = configPresent,
+                    ) { Text("Reconnect tunnel") }
+                }
+
+                if (reconnectRequired) {
+                    Spacer(Modifier.height(8.dp))
+                    Button(
+                        onClick = onApplyRouting,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text("Reconnect with new routing")
+                    }
+                }
+
+                if (state is VpnState.Connected) {
+                    Spacer(Modifier.height(12.dp))
+                    Text("Received: ${formatBytes(state.rxBytes)}")
+                    Text("Sent: ${formatBytes(state.txBytes)}")
+                    if (state.rxBytes == 0L && state.txBytes > 0L) {
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            "Traffic sent but 0 B received so far. If connectivity stalls, check gateway reachability in Setup.",
+                            style = MaterialTheme.typography.bodySmall,
+                        )
+                    }
+                }
+                if (state is VpnState.Error) {
+                    Spacer(Modifier.height(10.dp))
+                    Text(state.message, color = MaterialTheme.colorScheme.error)
+                }
             }
         }
     }
@@ -213,58 +340,106 @@ private fun VpnSection(
 private fun AppsSection(
     apps: List<com.blawhi3929bd.tunnelpilot.data.InstalledApp>,
     selectedApps: Set<String>,
+    routingMode: RoutingMode,
     onToggle: (String) -> Unit,
+    onClearSelection: () -> Unit,
     onRefresh: () -> Unit,
 ) {
-    var query by remember { mutableStateOf("") }
+    var query by rememberSaveable { mutableStateOf("") }
+    val installedPackageNames = remember(apps) { apps.map { it.packageName }.toSet() }
+    val installedSelectedCount = remember(selectedApps, installedPackageNames) {
+        selectedApps.count { it in installedPackageNames }
+    }
     val filtered = apps.filter {
         query.isBlank() || it.label.contains(query, ignoreCase = true) || it.packageName.contains(query, ignoreCase = true)
     }
 
     Text("Apps allowed to use the VPN", style = MaterialTheme.typography.titleLarge)
     Text("Selected-apps mode keeps the VPN connection active, but Android routes only the selected apps through it.")
+    Spacer(Modifier.height(4.dp))
+    Text(
+        "Selected: $installedSelectedCount installed app(s) (${apps.size} launchable apps detected)",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    if (routingMode == RoutingMode.SELECTED_APPS && installedSelectedCount == 0) {
+        Spacer(Modifier.height(4.dp))
+        Text(
+            "Select at least one installed app to connect in Selected-apps mode.",
+            color = MaterialTheme.colorScheme.error,
+            style = MaterialTheme.typography.bodySmall,
+        )
+    }
     Spacer(Modifier.height(8.dp))
     OutlinedTextField(
         value = query,
         onValueChange = { query = it },
         Modifier.fillMaxWidth(),
         label = { Text("Search apps") },
+        singleLine = true,
     )
     Spacer(Modifier.height(8.dp))
-    OutlinedButton(onClick = onRefresh, Modifier.fillMaxWidth()) { Text("Refresh app list") }
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(onClick = onRefresh, Modifier.weight(1f)) { Text("Refresh app list") }
+        OutlinedButton(
+            onClick = onClearSelection,
+            Modifier.weight(1f),
+            enabled = selectedApps.isNotEmpty(),
+        ) { Text("Clear selection") }
+    }
     Spacer(Modifier.height(8.dp))
-    LazyColumn(Modifier.fillMaxSize()) {
-        items(filtered, key = { it.packageName }) { app ->
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Checkbox(
-                    checked = app.packageName in selectedApps,
-                    onCheckedChange = { onToggle(app.packageName) },
-                )
-                Column(Modifier.weight(1f)) {
-                    Text(app.label)
-                    Text(app.packageName, style = MaterialTheme.typography.bodySmall)
+    if (filtered.isEmpty()) {
+        Text(
+            if (apps.isEmpty()) "No launchable apps found."
+            else "No apps match \"$query\".",
+            style = MaterialTheme.typography.bodyMedium,
+        )
+    } else {
+        LazyColumn(Modifier.fillMaxSize()) {
+            items(filtered, key = { it.packageName }) { app ->
+                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(
+                        checked = app.packageName in selectedApps,
+                        onCheckedChange = { onToggle(app.packageName) },
+                    )
+                    Column(Modifier.weight(1f)) {
+                        Text(app.label)
+                        Text(app.packageName, style = MaterialTheme.typography.bodySmall)
+                    }
                 }
+                HorizontalDivider()
             }
-            HorizontalDivider()
         }
     }
 }
-
 
 @Composable
 private fun SetupSection(
     controlPlaneUrl: String,
     provisioningState: ProvisioningState,
+    hasDeviceToken: Boolean,
     servers: List<RegisteredServer>,
     serversLoaded: Boolean,
+    serversLoading: Boolean,
     serversError: String?,
     onControlPlaneUrl: (String) -> Unit,
     onProvision: () -> Unit,
     onRotateKey: () -> Unit,
     onRefreshServers: () -> Unit,
     onResetIdentity: () -> Unit,
+    onForceResetLocalIdentity: () -> Unit,
 ) {
-    Column {
+    val isBusy = provisioningState is ProvisioningState.Provisioning
+    val latestError = when (provisioningState) {
+        is ProvisioningState.Provisioned -> provisioningState.lastError
+        is ProvisioningState.Error -> provisioningState.message
+        else -> null
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+    ) {
         Text("Automatic server setup", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(8.dp))
         Text(
@@ -278,20 +453,22 @@ private fun SetupSection(
             modifier = Modifier.fillMaxWidth(),
             label = { Text("Control plane URL") },
             singleLine = true,
+            enabled = !isBusy,
             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
         )
         Spacer(Modifier.height(12.dp))
         Button(
             modifier = Modifier.fillMaxWidth(),
             onClick = onProvision,
+            enabled = !isBusy,
         ) {
-            Text("Provision device")
+            Text(if (isBusy) "Provisioning…" else "Provision device")
         }
         Spacer(Modifier.height(8.dp))
         OutlinedButton(
             modifier = Modifier.fillMaxWidth(),
             onClick = onRotateKey,
-            enabled = provisioningState is ProvisioningState.Provisioned,
+            enabled = !isBusy && provisioningState is ProvisioningState.Provisioned && hasDeviceToken,
         ) {
             Text("Rotate client key")
         }
@@ -299,15 +476,29 @@ private fun SetupSection(
         OutlinedButton(
             modifier = Modifier.fillMaxWidth(),
             onClick = onRefreshServers,
+            enabled = !serversLoading,
         ) {
-            Text("Check server status")
+            Text(if (serversLoading) "Checking server status…" else "Check server status")
         }
         Spacer(Modifier.height(8.dp))
         TextButton(
             modifier = Modifier.fillMaxWidth(),
             onClick = onResetIdentity,
+            enabled = !isBusy,
         ) {
             Text("Reset local device identity")
+        }
+        if (latestError != null && hasDeviceToken) {
+            TextButton(
+                modifier = Modifier.fillMaxWidth(),
+                onClick = onForceResetLocalIdentity,
+                enabled = !isBusy,
+            ) {
+                Text(
+                    "Force local identity reset (offline / skip server revoke)",
+                    color = MaterialTheme.colorScheme.error,
+                )
+            }
         }
         Spacer(Modifier.height(12.dp))
         when (provisioningState) {
@@ -316,6 +507,11 @@ private fun SetupSection(
             is ProvisioningState.Provisioned -> {
                 Text("Device ID: ${provisioningState.deviceId}")
                 Text("VPN address: ${provisioningState.clientAddress}")
+                Text(
+                    if (hasDeviceToken) "Device authentication token: stored in Keystore"
+                    else "Configuration mode: manual or legacy (no device token)",
+                    style = MaterialTheme.typography.bodySmall,
+                )
                 Text("The generated configuration is stored encrypted locally.")
                 if (provisioningState.lastError != null) {
                     Spacer(Modifier.height(8.dp))
@@ -332,25 +528,37 @@ private fun SetupSection(
                 )
             }
         }
+        if (serversLoading) {
+            Spacer(Modifier.height(8.dp))
+            Text("Loading gateway catalog from control plane…", style = MaterialTheme.typography.bodySmall)
+        }
         if (serversError != null) {
             Spacer(Modifier.height(8.dp))
             Text(serversError, color = MaterialTheme.colorScheme.error)
+            if (servers.isNotEmpty()) {
+                Text(
+                    "Showing last known gateway catalog below (cached).",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
         }
         if (servers.isNotEmpty()) {
             Spacer(Modifier.height(12.dp))
             Text("Gateway catalog", style = MaterialTheme.typography.titleMedium)
             servers.forEach { server ->
-                val cap = if (server.peerCount != null && server.peerCapacity != null) {
-                    " (${server.peerCount}/${server.peerCapacity} peers)"
-                } else {
-                    ""
+                val cap = when {
+                    server.peerCount != null && server.peerCapacity != null && server.capacityRemaining != null ->
+                        " (${server.peerCount}/${server.peerCapacity} peers, ${server.capacityRemaining} free)"
+                    server.peerCount != null && server.peerCapacity != null ->
+                        " (${server.peerCount}/${server.peerCapacity} peers)"
+                    else -> ""
                 }
                 Text(
                     "${server.id} [${server.region}] ${server.hostname}:${server.port} — ${server.healthStatus}$cap",
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
-        } else if (serversLoaded) {
+        } else if (serversLoaded && !serversLoading) {
             Spacer(Modifier.height(8.dp))
             Text("No enabled VPN servers reported by control plane.")
         }
@@ -360,13 +568,24 @@ private fun SetupSection(
 @Composable
 private fun ConfigSection(
     configPresent: Boolean,
+    provisioningState: ProvisioningState,
     onSave: (String) -> Result<Unit>,
     onClear: () -> Unit,
+    onForceClearLocal: () -> Unit,
 ) {
-    var text by remember { mutableStateOf("") }
-    var message by remember { mutableStateOf<String?>(null) }
+    var text by rememberSaveable { mutableStateOf("") }
+    var message by rememberSaveable { mutableStateOf<String?>(null) }
+    val hasProvisioningError = when (provisioningState) {
+        is ProvisioningState.Provisioned -> provisioningState.lastError != null
+        is ProvisioningState.Error -> true
+        else -> false
+    }
 
-    Column {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState()),
+    ) {
         Text("WireGuard configuration", style = MaterialTheme.typography.titleLarge)
         Spacer(Modifier.height(8.dp))
         Text(
@@ -398,10 +617,25 @@ private fun ConfigSection(
                 onClick = {
                     onClear()
                     text = ""
-                    message = "Saved configuration removed."
+                    message = "Requested configuration removal."
                 },
                 modifier = Modifier.fillMaxWidth(),
             ) { Text("Delete saved configuration") }
+            if (hasProvisioningError) {
+                TextButton(
+                    onClick = {
+                        onForceClearLocal()
+                        text = ""
+                        message = "Local configuration removed without server revocation."
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        "Force delete local configuration (offline / skip server revoke)",
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
+            }
         }
         message?.let {
             Spacer(Modifier.height(8.dp))
@@ -415,6 +649,21 @@ private fun stateLabel(state: VpnState): String = when (state) {
     VpnState.Connecting -> "Connecting…"
     is VpnState.Connected -> "Connected"
     is VpnState.Error -> "Error"
+}
+
+private fun provisioningSummary(state: ProvisioningState, configPresent: Boolean): String = when (state) {
+    is ProvisioningState.Provisioned -> "Configuration: Provisioned (${state.clientAddress})"
+    ProvisioningState.Provisioning -> "Configuration: Provisioning in progress…"
+    is ProvisioningState.Error -> if (configPresent) {
+        "Configuration: Stored locally (last operation failed)"
+    } else {
+        "Configuration: Not provisioned (${state.message})"
+    }
+    ProvisioningState.NotConfigured -> if (configPresent) {
+        "Configuration: Stored locally"
+    } else {
+        "Configuration: Not configured"
+    }
 }
 
 private fun routingDescription(mode: RoutingMode, selectedCount: Int): String = when (mode) {
