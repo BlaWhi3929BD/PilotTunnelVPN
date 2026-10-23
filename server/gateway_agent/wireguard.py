@@ -3,11 +3,30 @@ from __future__ import annotations
 import base64
 import binascii
 import ipaddress
+import re
 import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 Runner = Callable[..., subprocess.CompletedProcess[str]]
+_INTERFACE_NAME_RE = re.compile(r"^[a-zA-Z0-9_.-]{1,15}$")
+
+
+def validate_interface_name(
+    value: str,
+    *,
+    required_prefix: str = "tunnelpilot",
+    allow_nonstandard: bool = False,
+) -> str:
+    cleaned = value.strip()
+    if not _INTERFACE_NAME_RE.match(cleaned):
+        raise ValueError("WireGuard interface name is invalid")
+    if not allow_nonstandard and not cleaned.startswith(required_prefix):
+        raise ValueError(
+            f"Refusing to manage non-TunnelPilot WireGuard interface '{cleaned}' "
+            f"(expected prefix '{required_prefix}')"
+        )
+    return cleaned
 
 
 def validate_public_key(value: str) -> str:
@@ -37,8 +56,16 @@ class WireGuardController:
     binary: str = "wg"
     runner: Runner = subprocess.run
     timeout_seconds: float = 5.0
+    allow_nonstandard_interface: bool = False
+
+    def ensure_managed_interface(self) -> str:
+        return validate_interface_name(
+            self.interface,
+            allow_nonstandard=self.allow_nonstandard_interface,
+        )
 
     def _run(self, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        self.ensure_managed_interface()
         try:
             return self.runner(
                 list(args),
@@ -62,6 +89,23 @@ class WireGuardController:
     def list_peers(self) -> list[str]:
         result = self._run([self.binary, "show", self.interface, "peers"])
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def list_peer_allowed_ips(self) -> dict[str, list[str]]:
+        result = self._run([self.binary, "show", self.interface, "allowed-ips"])
+        mapping: dict[str, list[str]] = {}
+        for raw_line in result.stdout.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            parts = line.split(None, 1)
+            peer_key = parts[0].strip()
+            if len(parts) == 1 or parts[1].strip() == "(none)":
+                mapping[peer_key] = []
+            else:
+                mapping[peer_key] = [
+                    cidr.strip() for cidr in parts[1].split() if cidr.strip() and cidr.strip() != "(none)"
+                ]
+        return mapping
 
     def peer_count(self) -> int:
         return len(self.list_peers())

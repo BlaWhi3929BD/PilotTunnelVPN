@@ -18,3 +18,5 @@ __pycache__/
 .pytest_cache/
 server/data/*.db
 server/data/*.db-*
+server/data/*.token
+*.token

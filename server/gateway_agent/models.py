@@ -29,6 +29,7 @@ class PeerResponse(BaseModel):
 class PeerListResponse(BaseModel):
     interface: str
     peers: list[str]
+    peer_allowed_ips: dict[str, list[str]] = Field(default_factory=dict)
 
 
 class GatewayHealthResponse(BaseModel):

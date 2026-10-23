@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import os
 
 from fastapi import FastAPI, Header, HTTPException, Query, status
@@ -13,8 +14,15 @@ GATEWAY_AGENT_TOKEN = os.getenv("TUNNELPILOT_GATEWAY_AGENT_TOKEN")
 WG_INTERFACE = os.getenv("TUNNELPILOT_WG_INTERFACE", "tunnelpilot0")
 WG_BINARY = os.getenv("TUNNELPILOT_WG_BINARY", "wg")
 WG_MAX_PEERS = max(1, int(os.getenv("TUNNELPILOT_WG_MAX_PEERS", "240")))
+ALLOW_NONSTANDARD_WG_INTERFACE = os.getenv(
+    "TUNNELPILOT_ALLOW_NONSTANDARD_WG_INTERFACE", "false"
+).lower() in {"1", "true", "yes", "on"}
 
-controller = WireGuardController(interface=WG_INTERFACE, binary=WG_BINARY)
+controller = WireGuardController(
+    interface=WG_INTERFACE,
+    binary=WG_BINARY,
+    allow_nonstandard_interface=ALLOW_NONSTANDARD_WG_INTERFACE,
+)
 
 
 def _require_auth(authorization: str | None) -> None:
@@ -23,16 +31,17 @@ def _require_auth(authorization: str | None) -> None:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Gateway agent token is not configured",
         )
-    if authorization != f"Bearer {GATEWAY_AGENT_TOKEN}":
+    if not authorization or not hmac.compare_digest(authorization, f"Bearer {GATEWAY_AGENT_TOKEN}"):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
 
 @app.get("/healthz", response_model=GatewayHealthResponse)
 def healthz() -> GatewayHealthResponse:
     try:
+        controller.ensure_managed_interface()
         controller.ensure_available()
         peer_count = controller.peer_count()
-    except RuntimeError:
+    except (RuntimeError, ValueError):
         return GatewayHealthResponse(
             status="degraded",
             interface=WG_INTERFACE,
@@ -59,11 +68,22 @@ def list_peers(
 ) -> PeerListResponse:
     _require_auth(authorization)
     try:
+        controller.ensure_managed_interface()
         peers = controller.list_peers()
+        try:
+            peer_allowed_ips = controller.list_peer_allowed_ips()
+        except Exception:
+            peer_allowed_ips = {}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 
-    return PeerListResponse(interface=WG_INTERFACE, peers=peers)
+    return PeerListResponse(
+        interface=WG_INTERFACE,
+        peers=peers,
+        peer_allowed_ips=peer_allowed_ips,
+    )
 
 
 @app.post("/v1/peers", response_model=PeerResponse)
@@ -74,6 +94,8 @@ def add_peer(
     _require_auth(authorization)
     try:
         controller.add_peer(request.public_key, request.allowed_ip)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
 

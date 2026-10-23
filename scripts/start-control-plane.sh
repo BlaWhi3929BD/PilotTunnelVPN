@@ -4,12 +4,15 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 REPO_ROOT="$(pwd)"
 
-if [[ ! -f /tmp/tunnelpilot-gateway-agent-token ]]; then
-  echo "Error: /tmp/tunnelpilot-gateway-agent-token not found. Start gateway agent first!" >&2
+TOKEN_FILE="$REPO_ROOT/server/data/gateway-agent.token"
+if [[ -f "$TOKEN_FILE" ]]; then
+  GATEWAY_TOKEN="$(cat "$TOKEN_FILE")"
+elif [[ -f /tmp/tunnelpilot-gateway-agent-token ]]; then
+  GATEWAY_TOKEN="$(sudo cat /tmp/tunnelpilot-gateway-agent-token)"
+else
+  echo "Error: gateway agent token not found. Start gateway agent first!" >&2
   exit 1
 fi
-
-GATEWAY_TOKEN="$(sudo cat /tmp/tunnelpilot-gateway-agent-token)"
 SERVER_PUBKEY="$(sudo cat /etc/wireguard/tunnelpilot0-server_public.key)"
 
 # Detect USB tethering interface IP if present, otherwise default route IP

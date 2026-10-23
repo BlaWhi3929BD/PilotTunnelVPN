@@ -1,4 +1,10 @@
+import base64
+import pytest
+
 from server.app.storage import DeviceStore
+
+KEY_ONE = base64.b64encode(b"\x01" * 32).decode("ascii")
+KEY_TWO = base64.b64encode(b"\x02" * 32).decode("ascii")
 
 
 def test_device_store_persists_records_and_allocates_unique_addresses(tmp_path) -> None:
@@ -7,7 +13,7 @@ def test_device_store_persists_records_and_allocates_unique_addresses(tmp_path) 
 
     first = store.create(
         device_id="device-one",
-        client_public_key="A" * 43,
+        client_public_key=KEY_ONE,
         app_version="0.1.0",
         server_id="dev-1",
         created_at="2026-10-08T00:00:00+00:00",
@@ -21,7 +27,7 @@ def test_device_store_persists_records_and_allocates_unique_addresses(tmp_path) 
     reopened = DeviceStore(path)
     second = reopened.create(
         device_id="device-two",
-        client_public_key="B" * 43,
+        client_public_key=KEY_TWO,
         app_version="0.1.0",
         server_id="dev-1",
         created_at="2026-10-08T00:00:01+00:00",
@@ -31,5 +37,48 @@ def test_device_store_persists_records_and_allocates_unique_addresses(tmp_path) 
         device_token_hash="token-two",
     )
     assert second["client_address"] == "10.67.0.3/32"
-    assert reopened.get("device-one")["client_public_key"] == "A" * 43
+    assert reopened.get("device-one")["client_public_key"] == KEY_ONE
     assert len(reopened.list()) == 2
+
+
+def test_device_store_anchors_relative_path_and_verifies_integrity(tmp_path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+    store = DeviceStore("relative_dir/devices.db")
+    store.create(
+        device_id="device-one",
+        client_public_key=KEY_ONE,
+        app_version="0.2.0",
+        server_id="dev-1",
+        created_at="2026-10-08T00:00:00+00:00",
+        last_seen_at="2026-10-08T00:00:00+00:00",
+        vpn_address_pool="10.67.0.0/24",
+        vpn_gateway_address="10.67.0.1",
+        device_token_hash="token-one",
+    )
+
+    other_dir = tmp_path / "subdir"
+    other_dir.mkdir()
+    monkeypatch.chdir(other_dir)
+
+    # Even after changing cwd, store still points to the same database and passes integrity check
+    rows = store.verify_integrity(vpn_address_pool="10.67.0.0/24", vpn_gateway_address="10.67.0.1")
+    assert len(rows) == 1
+    assert rows[0]["device_id"] == "device-one"
+
+    # Backup creates an identical verifiable database
+    backup_path = store.backup_to(tmp_path / "backups" / "devices-backup.db")
+    backup_store = DeviceStore(backup_path)
+    assert len(backup_store.verify_integrity(vpn_address_pool="10.67.0.0/24", vpn_gateway_address="10.67.0.1")) == 1
+
+    # Pool mismatch is caught by verify_integrity
+    with pytest.raises(RuntimeError, match="outside pool"):
+        store.verify_integrity(vpn_address_pool="10.68.0.0/24", vpn_gateway_address="10.68.0.1")
+
+
+def test_device_store_verify_integrity_detects_corrupted_file(tmp_path) -> None:
+    path = tmp_path / "corrupt.db"
+    store = DeviceStore(path)
+    path.write_bytes(b"not a valid sqlite file")
+
+    with pytest.raises(RuntimeError, match="corrupted or unreadable"):
+        store.verify_integrity()

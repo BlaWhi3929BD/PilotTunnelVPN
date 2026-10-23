@@ -10,6 +10,7 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Annotated
 from urllib.parse import quote
 
@@ -25,15 +26,27 @@ RECONCILE_ON_STARTUP = os.getenv("TUNNELPILOT_RECONCILE_ON_STARTUP", "true").low
     "yes",
     "on",
 }
+ENVIRONMENT = os.getenv("TUNNELPILOT_ENV", "development").strip().lower()
+ALLOW_OPEN_REGISTRATION = os.getenv("TUNNELPILOT_ALLOW_OPEN_REGISTRATION", "false").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+ALLOW_NONSTANDARD_WG_INTERFACE = os.getenv(
+    "TUNNELPILOT_ALLOW_NONSTANDARD_WG_INTERFACE", "false"
+).lower() in {"1", "true", "yes", "on"}
 
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    _validate_runtime_configuration()
     if RECONCILE_ON_STARTUP:
         for server in SERVERS:
             if server.enabled and _gateway_url(server):
                 try:
-                    _reconcile_server(server)
+                    # Startup reconciliation is strictly non-destructive (prune_unknown=False).
+                    _reconcile_server(server, dry_run=False, prune_unknown=False)
                 except Exception:
                     pass
     yield
@@ -53,7 +66,10 @@ SERVER_PUBLIC_KEY = os.getenv("TUNNELPILOT_SERVER_PUBLIC_KEY", "replace-with-gat
 SERVER_PORT = int(os.getenv("TUNNELPILOT_SERVER_PORT", "51820"))
 SERVER_ENABLED = os.getenv("TUNNELPILOT_SERVER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 GATEWAY_HEALTH_TIMEOUT = float(os.getenv("TUNNELPILOT_GATEWAY_HEALTH_TIMEOUT", "3.0"))
-DATABASE_PATH = os.getenv("TUNNELPILOT_DATABASE_PATH", "server/data/tunnelpilot.db")
+_DEFAULT_DATABASE_PATH = str(
+    Path(__file__).resolve().parents[2] / "server" / "data" / "tunnelpilot.db"
+)
+DATABASE_PATH = os.getenv("TUNNELPILOT_DATABASE_PATH", _DEFAULT_DATABASE_PATH)
 
 
 class Server(BaseModel):
@@ -129,8 +145,14 @@ class DeviceRotationResponse(BaseModel):
 class ServerReconcileReport(BaseModel):
     server_id: str
     status: str
+    dry_run: bool = False
+    prune_unknown: bool = False
     restored_peers: int = 0
     removed_peers: int = 0
+    would_restore_peers: int = 0
+    would_remove_peers: int = 0
+    unknown_peers: int = 0
+    unmanaged_peers: int = 0
     detail: str | None = None
 
 
@@ -193,9 +215,58 @@ def _load_record(device_id: str) -> DeviceRecord | None:
     return record
 
 
-def _require_control_plane_auth(authorization: str | None) -> None:
-    if CONTROL_PLANE_TOKEN is not None and authorization != f"Bearer {CONTROL_PLANE_TOKEN}":
+def _is_valid_admin_token(authorization: str | None) -> bool:
+    if not CONTROL_PLANE_TOKEN or not CONTROL_PLANE_TOKEN.strip() or not authorization:
+        return False
+    expected = f"Bearer {CONTROL_PLANE_TOKEN}"
+    return hmac.compare_digest(authorization, expected)
+
+
+def _require_admin_auth(authorization: str | None) -> None:
+    if not CONTROL_PLANE_TOKEN or not CONTROL_PLANE_TOKEN.strip():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Control plane admin token is not configured",
+        )
+    if not _is_valid_admin_token(authorization):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+
+
+def _require_control_plane_auth(authorization: str | None) -> None:
+    if CONTROL_PLANE_TOKEN is not None and CONTROL_PLANE_TOKEN.strip():
+        if not _is_valid_admin_token(authorization):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
+        return
+    if ENVIRONMENT == "production" and not ALLOW_OPEN_REGISTRATION:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Control plane enrollment token is required in production unless TUNNELPILOT_ALLOW_OPEN_REGISTRATION=true",
+        )
+
+
+def _validate_runtime_configuration() -> None:
+    if ENVIRONMENT != "production":
+        return
+    if not CONTROL_PLANE_TOKEN or not CONTROL_PLANE_TOKEN.strip():
+        raise RuntimeError("TUNNELPILOT_CONTROL_PLANE_TOKEN must be configured in production")
+    enabled_servers = [srv for srv in SERVERS if srv.enabled]
+    if not enabled_servers:
+        raise RuntimeError("At least one enabled VPN server is required in production")
+    for srv in enabled_servers:
+        if not _gateway_url(srv) or not GATEWAY_AGENT_TOKEN or not GATEWAY_AGENT_TOKEN.strip():
+            raise RuntimeError(
+                f"Gateway agent URL and token must be configured for server '{srv.id}' in production"
+            )
+        if not srv.hostname.strip() or srv.hostname.strip() == "replace-with-real-gateway":
+            raise RuntimeError(
+                f"Server '{srv.id}' has a placeholder or empty hostname in production"
+            )
+        try:
+            _validate_public_key(srv.public_key)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Server '{srv.id}' has an invalid WireGuard public key in production"
+            ) from exc
 
 
 def _token_hash(token: str) -> str:
@@ -363,24 +434,27 @@ def _revoke_peer(server: Server, public_key: str) -> None:
 def _rotate_peer(server: Server, old_public_key: str, new_public_key: str, client_address: str) -> None:
     if old_public_key == new_public_key:
         return
-    _revoke_peer(server, old_public_key)
+    # Install the new peer FIRST so the old peer is never destroyed if the gateway is unreachable or rejects the new key.
+    _provision_peer(server, new_public_key, client_address)
     try:
-        _provision_peer(server, new_public_key, client_address)
+        _revoke_peer(server, old_public_key)
     except Exception:
-        run_error = None
+        rollback_error = None
         try:
+            # Re-bind client_address to old_public_key and clean up new_public_key
             _provision_peer(server, old_public_key, client_address)
+            _revoke_peer(server, new_public_key)
         except Exception as exc:
-            run_error = exc
-        if run_error is not None:
+            rollback_error = exc
+        if rollback_error is not None:
             raise HTTPException(
                 status_code=502,
-                detail="Gateway peer rotation failed and rollback also failed",
-            ) from run_error
+                detail="Gateway peer rotation failed while removing old peer and rollback also failed",
+            ) from rollback_error
         raise
 
 
-def _list_gateway_peers(server: Server) -> list[str]:
+def _list_gateway_peer_state(server: Server) -> tuple[str, list[str], dict[str, list[str]]]:
     response = _gateway_request("GET", "/v1/peers", server=server)
     if response.status_code >= 300:
         detail = response.text[:300] or "Gateway agent rejected peer listing"
@@ -389,24 +463,102 @@ def _list_gateway_peers(server: Server) -> list[str]:
         payload = response.json()
     except ValueError as exc:
         raise HTTPException(status_code=502, detail="Gateway agent returned invalid JSON for /v1/peers") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=502, detail="Gateway agent returned invalid /v1/peers payload")
+
+    interface = payload.get("interface")
+    if not isinstance(interface, str) or not interface.strip():
+        raise HTTPException(status_code=502, detail="Gateway agent did not report WireGuard interface name")
+    if not ALLOW_NONSTANDARD_WG_INTERFACE and not interface.strip().startswith("tunnelpilot"):
+        raise HTTPException(
+            status_code=502,
+            detail=f"Refusing to reconcile non-TunnelPilot WireGuard interface '{interface}'",
+        )
+
     peers = payload.get("peers")
     if not isinstance(peers, list) or not all(isinstance(item, str) for item in peers):
         raise HTTPException(status_code=502, detail="Gateway agent returned invalid peers list")
+    validated_peers: list[str] = []
+    for peer_key in peers:
+        try:
+            validated_peers.append(_validate_public_key(peer_key))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Gateway agent returned malformed peer public key",
+            ) from exc
+
+    raw_allowed = payload.get("peer_allowed_ips", {})
+    if raw_allowed is None:
+        raw_allowed = {}
+    if not isinstance(raw_allowed, dict):
+        raise HTTPException(status_code=502, detail="Gateway agent returned invalid peer_allowed_ips map")
+
+    peer_allowed_ips: dict[str, list[str]] = {}
+    for key, cidrs in raw_allowed.items():
+        if not isinstance(key, str) or not isinstance(cidrs, list) or not all(isinstance(c, str) for c in cidrs):
+            raise HTTPException(status_code=502, detail="Gateway agent returned malformed peer_allowed_ips entry")
+        peer_allowed_ips[key] = [c.strip() for c in cidrs if c.strip()]
+
+    return interface.strip(), validated_peers, peer_allowed_ips
+
+
+def _list_gateway_peers(server: Server) -> list[str]:
+    _, peers, _ = _list_gateway_peer_state(server)
     return peers
 
 
-def _reconcile_server(server: Server) -> ServerReconcileReport:
+def _is_managed_pool_peer(allowed_cidrs: list[str] | None, pool_network: ipaddress.IPv4Network) -> bool:
+    if allowed_cidrs is None:
+        # Gateway did not report per-peer allowed-ips; interface ownership was already verified as tunnelpilot*.
+        return True
+    if len(allowed_cidrs) == 0:
+        return True
+    if len(allowed_cidrs) != 1:
+        return False
+    try:
+        net = ipaddress.ip_network(allowed_cidrs[0], strict=True)
+    except ValueError:
+        return False
+    return isinstance(net, ipaddress.IPv4Network) and net.prefixlen == 32 and net.network_address in pool_network
+
+
+def _reconcile_server(
+    server: Server,
+    *,
+    dry_run: bool = False,
+    prune_unknown: bool = False,
+    confirm_empty_db: bool = False,
+) -> ServerReconcileReport:
     if not _gateway_url(server):
         return ServerReconcileReport(
             server_id=server.id,
             status="skipped",
+            dry_run=dry_run,
+            prune_unknown=prune_unknown,
             detail="Gateway agent URL is not configured",
         )
 
-    active_peers = set(_list_gateway_peers(server))
+    try:
+        validated_rows = DEVICE_STORE.verify_integrity(
+            vpn_address_pool=VPN_ADDRESS_POOL,
+            vpn_gateway_address=VPN_GATEWAY_ADDRESS,
+        )
+        pool_network = ipaddress.ip_network(VPN_ADDRESS_POOL, strict=True)
+        if not isinstance(pool_network, ipaddress.IPv4Network):
+            raise RuntimeError("TUNNELPILOT_VPN_ADDRESS_POOL must be an IPv4 network")
+    except (RuntimeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Refusing gateway reconciliation due to database or pool state error: {exc}",
+        ) from exc
+
+    _, peers_list, peer_allowed_ips = _list_gateway_peer_state(server)
+    active_peers = set(peers_list)
+
     expected_rows = [
         row
-        for row in DEVICE_STORE.list()
+        for row in validated_rows
         if row["server_id"] == server.id and bool(row["provisioned"])
     ]
     expected_map = {
@@ -414,22 +566,67 @@ def _reconcile_server(server: Server) -> ServerReconcileReport:
         for row in expected_rows
     }
 
-    restored = 0
+    to_restore: list[tuple[str, str]] = []
     for public_key, client_address in expected_map.items():
         if public_key not in active_peers:
-            _provision_peer(server, public_key, client_address)
-            restored += 1
+            to_restore.append((public_key, client_address))
+        elif public_key in peer_allowed_ips and peer_allowed_ips[public_key] != [client_address]:
+            to_restore.append((public_key, client_address))
+
+    prunable_unknown: list[str] = []
+    unmanaged_unknown: list[str] = []
+    for unknown_key in sorted(active_peers - expected_map.keys()):
+        allowed_for_peer = peer_allowed_ips.get(unknown_key) if peer_allowed_ips else None
+        if _is_managed_pool_peer(allowed_for_peer, pool_network):
+            prunable_unknown.append(unknown_key)
+        else:
+            unmanaged_unknown.append(unknown_key)
+
+    if prune_unknown and len(expected_map) == 0 and len(prunable_unknown) > 0 and not confirm_empty_db:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Refusing to prune active gateway peers against an empty server device inventory; "
+                "pass confirm_empty_db=true to explicitly allow pruning all peers"
+            ),
+        )
+
+    if dry_run:
+        return ServerReconcileReport(
+            server_id=server.id,
+            status="dry_run",
+            dry_run=True,
+            prune_unknown=prune_unknown,
+            restored_peers=0,
+            removed_peers=0,
+            would_restore_peers=len(to_restore),
+            would_remove_peers=len(prunable_unknown) if prune_unknown else 0,
+            unknown_peers=len(prunable_unknown),
+            unmanaged_peers=len(unmanaged_unknown),
+        )
+
+    restored = 0
+    for public_key, client_address in to_restore:
+        _provision_peer(server, public_key, client_address)
+        restored += 1
 
     removed = 0
-    for stale_key in sorted(active_peers - expected_map.keys()):
-        _revoke_peer(server, stale_key)
-        removed += 1
+    if prune_unknown:
+        for stale_key in prunable_unknown:
+            _revoke_peer(server, stale_key)
+            removed += 1
 
     return ServerReconcileReport(
         server_id=server.id,
         status="reconciled",
+        dry_run=False,
+        prune_unknown=prune_unknown,
         restored_peers=restored,
         removed_peers=removed,
+        would_restore_peers=restored,
+        would_remove_peers=removed,
+        unknown_peers=len(prunable_unknown),
+        unmanaged_peers=len(unmanaged_unknown),
     )
 
 
@@ -455,22 +652,41 @@ def list_servers() -> list[Server]:
 @app.post("/v1/servers/reconcile", response_model=list[ServerReconcileReport])
 def reconcile_servers(
     authorization: Annotated[str | None, Header()] = None,
+    dry_run: bool = False,
+    prune_unknown: bool = False,
+    confirm_empty_db: bool = False,
 ) -> list[ServerReconcileReport]:
-    _require_control_plane_auth(authorization)
+    _require_admin_auth(authorization)
     enabled = [server for server in SERVERS if server.enabled]
-    return [_reconcile_server(server) for server in enabled]
+    return [
+        _reconcile_server(
+            server,
+            dry_run=dry_run,
+            prune_unknown=prune_unknown,
+            confirm_empty_db=confirm_empty_db,
+        )
+        for server in enabled
+    ]
 
 
 @app.post("/v1/servers/{server_id}/reconcile", response_model=ServerReconcileReport)
 def reconcile_single_server(
     server_id: str,
     authorization: Annotated[str | None, Header()] = None,
+    dry_run: bool = False,
+    prune_unknown: bool = False,
+    confirm_empty_db: bool = False,
 ) -> ServerReconcileReport:
-    _require_control_plane_auth(authorization)
+    _require_admin_auth(authorization)
     server = next((item for item in SERVERS if item.id == server_id and item.enabled), None)
     if server is None:
         raise HTTPException(status_code=404, detail="Server not found")
-    return _reconcile_server(server)
+    return _reconcile_server(
+        server,
+        dry_run=dry_run,
+        prune_unknown=prune_unknown,
+        confirm_empty_db=confirm_empty_db,
+    )
 
 
 @app.post("/v1/devices", response_model=DeviceRegistrationResponse)
@@ -584,6 +800,15 @@ def rotate_device_key(
         server = next((item for item in SERVERS if item.id == record.server_id and item.enabled), None)
         if server is None:
             raise HTTPException(status_code=503, detail="Assigned VPN server is unavailable")
+        if _gateway_url(server):
+            _provision_peer(server, record.client_public_key, record.client_address)
+            if not record.provisioned:
+                DEVICE_STORE.update(
+                    device_id=device_id,
+                    last_seen_at=_utc_now().isoformat(),
+                    provisioned=True,
+                )
+                record = _load_record(device_id) or record
         return DeviceRotationResponse(
             status="unchanged",
             device_id=record.device_id,
@@ -620,13 +845,15 @@ def rotate_device_key(
         )
     except Exception as exc:
         try:
-            _revoke_peer(server, new_public_key)
             _provision_peer(server, old_public_key, client_address)
+            _revoke_peer(server, new_public_key)
         except Exception as rollback_error:
             raise HTTPException(
                 status_code=502,
                 detail="Device state update failed and gateway rollback also failed",
             ) from rollback_error
+        if isinstance(exc, ValueError):
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         raise HTTPException(status_code=503, detail="Device state update failed; rotation rolled back") from exc
 
     updated = _load_record(device_id)
@@ -646,16 +873,23 @@ def _require_revocation_auth(
     record: DeviceRecord,
     authorization: str | None,
     device_token: str | None,
-) -> None:
-    if CONTROL_PLANE_TOKEN is not None and authorization == f"Bearer {CONTROL_PLANE_TOKEN}":
-        return
+    *,
+    force: bool = False,
+) -> bool:
+    if _is_valid_admin_token(authorization):
+        return True
 
     if (
         device_token
         and record.device_token_hash
         and hmac.compare_digest(record.device_token_hash, _token_hash(device_token))
     ):
-        return
+        if force:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="force=true requires administrative Bearer token",
+            )
+        return False
 
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -674,7 +908,7 @@ def revoke_device(
     if record is None:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    _require_revocation_auth(record, authorization, x_device_token)
+    _require_revocation_auth(record, authorization, x_device_token, force=force)
 
     server = next((item for item in SERVERS if item.id == record.server_id), None)
     if server is None and not force:

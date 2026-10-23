@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import binascii
 import ipaddress
 import sqlite3
 from pathlib import Path
@@ -10,7 +12,7 @@ class DeviceStore:
     """Small SQLite persistence layer for control-plane device state."""
 
     def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
+        self.path = Path(path).expanduser().resolve()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
@@ -74,6 +76,100 @@ class DeviceStore:
                 "SELECT * FROM devices ORDER BY created_at, device_id"
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def verify_integrity(
+        self,
+        *,
+        vpn_address_pool: str | None = None,
+        vpn_gateway_address: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not self.path.exists():
+            raise RuntimeError(f"SQLite database file does not exist: {self.path}")
+        try:
+            with self.path.open("rb") as handle:
+                header = handle.read(16)
+        except OSError as exc:
+            raise RuntimeError(f"SQLite database is corrupted or unreadable: {exc}") from exc
+        if len(header) > 0 and header != b"SQLite format 3\x00":
+            raise RuntimeError("SQLite database is corrupted or unreadable: invalid file header")
+
+        pool_network = (
+            ipaddress.ip_network(vpn_address_pool, strict=True)
+            if vpn_address_pool is not None
+            else None
+        )
+        gateway_ip = (
+            ipaddress.ip_address(vpn_gateway_address)
+            if vpn_gateway_address is not None
+            else None
+        )
+
+        try:
+            with self._connect() as connection:
+                check_rows = connection.execute("PRAGMA quick_check").fetchall()
+                results = [str(row[0]) for row in check_rows]
+                if results != ["ok"]:
+                    raise RuntimeError(f"SQLite integrity check failed: {', '.join(results)}")
+                rows = [
+                    dict(row)
+                    for row in connection.execute(
+                        "SELECT * FROM devices ORDER BY created_at, device_id"
+                    ).fetchall()
+                ]
+        except sqlite3.DatabaseError as exc:
+            raise RuntimeError(f"SQLite database is corrupted or unreadable: {exc}") from exc
+
+        seen_keys: set[str] = set()
+        seen_addresses: set[str] = set()
+        for row in rows:
+            pub_key = str(row.get("client_public_key", ""))
+            try:
+                decoded = base64.b64decode(pub_key, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise RuntimeError(
+                    f"Corrupted client_public_key for device {row.get('device_id')}"
+                ) from exc
+            if len(decoded) != 32:
+                raise RuntimeError(
+                    f"Invalid client_public_key length for device {row.get('device_id')}"
+                )
+            if pub_key in seen_keys:
+                raise RuntimeError(f"Duplicate client_public_key detected: {pub_key}")
+            seen_keys.add(pub_key)
+
+            client_addr = str(row.get("client_address", ""))
+            try:
+                addr_net = ipaddress.ip_network(client_addr, strict=True)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Corrupted client_address '{client_addr}' for device {row.get('device_id')}"
+                ) from exc
+            if addr_net.version != 4 or addr_net.prefixlen != 32:
+                raise RuntimeError(
+                    f"Non-/32 IPv4 client_address '{client_addr}' for device {row.get('device_id')}"
+                )
+            host_ip = addr_net.network_address
+            if pool_network is not None and host_ip not in pool_network:
+                raise RuntimeError(
+                    f"Device {row.get('device_id')} address {client_addr} is outside pool {pool_network}"
+                )
+            if gateway_ip is not None and host_ip == gateway_ip:
+                raise RuntimeError(
+                    f"Device {row.get('device_id')} address {client_addr} collides with gateway {gateway_ip}"
+                )
+            if client_addr in seen_addresses:
+                raise RuntimeError(f"Duplicate client_address detected: {client_addr}")
+            seen_addresses.add(client_addr)
+
+        return rows
+
+    def backup_to(self, destination: str | Path) -> Path:
+        dest_path = Path(destination).expanduser().resolve()
+        dest_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._connect() as src_conn:
+            with sqlite3.connect(dest_path, timeout=10.0) as dst_conn:
+                src_conn.backup(dst_conn)
+        return dest_path
 
     def create(
         self,
@@ -183,10 +279,21 @@ class DeviceStore:
             return
         values.append(device_id)
         with self._connect() as connection:
-            connection.execute(
-                f"UPDATE devices SET {', '.join(fields)} WHERE device_id = ?",
-                values,
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    f"UPDATE devices SET {', '.join(fields)} WHERE device_id = ?",
+                    values,
+                )
+                connection.commit()
+            except sqlite3.IntegrityError as exc:
+                connection.rollback()
+                raise ValueError(
+                    "client_public_key or client_address is already registered to another device_id"
+                ) from exc
+            except Exception:
+                connection.rollback()
+                raise
 
     def delete(self, device_id: str) -> None:
         with self._connect() as connection:
