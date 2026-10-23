@@ -7,6 +7,8 @@ import hmac
 import ipaddress
 import os
 import secrets
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Annotated
 from urllib.parse import quote
@@ -17,7 +19,27 @@ from pydantic import BaseModel, Field, field_validator
 
 from .storage import DeviceStore
 
-app = FastAPI(title="TunnelPilot Control Plane", version="0.5.0")
+RECONCILE_ON_STARTUP = os.getenv("TUNNELPILOT_RECONCILE_ON_STARTUP", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> AsyncIterator[None]:
+    if RECONCILE_ON_STARTUP:
+        for server in SERVERS:
+            if server.enabled and _gateway_url(server):
+                try:
+                    _reconcile_server(server)
+                except Exception:
+                    pass
+    yield
+
+
+app = FastAPI(title="TunnelPilot Control Plane", version="0.6.0", lifespan=_lifespan)
 
 CONTROL_PLANE_TOKEN = os.getenv("TUNNELPILOT_CONTROL_PLANE_TOKEN")
 GATEWAY_AGENT_URL = os.getenv("TUNNELPILOT_GATEWAY_AGENT_URL")
@@ -102,6 +124,14 @@ class DeviceRotationResponse(BaseModel):
     client_address: str
     provisioned: bool
     server: Server
+
+
+class ServerReconcileReport(BaseModel):
+    server_id: str
+    status: str
+    restored_peers: int = 0
+    removed_peers: int = 0
+    detail: str | None = None
 
 
 SERVERS = [
@@ -350,6 +380,59 @@ def _rotate_peer(server: Server, old_public_key: str, new_public_key: str, clien
         raise
 
 
+def _list_gateway_peers(server: Server) -> list[str]:
+    response = _gateway_request("GET", "/v1/peers", server=server)
+    if response.status_code >= 300:
+        detail = response.text[:300] or "Gateway agent rejected peer listing"
+        raise HTTPException(status_code=502, detail=detail)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=502, detail="Gateway agent returned invalid JSON for /v1/peers") from exc
+    peers = payload.get("peers")
+    if not isinstance(peers, list) or not all(isinstance(item, str) for item in peers):
+        raise HTTPException(status_code=502, detail="Gateway agent returned invalid peers list")
+    return peers
+
+
+def _reconcile_server(server: Server) -> ServerReconcileReport:
+    if not _gateway_url(server):
+        return ServerReconcileReport(
+            server_id=server.id,
+            status="skipped",
+            detail="Gateway agent URL is not configured",
+        )
+
+    active_peers = set(_list_gateway_peers(server))
+    expected_rows = [
+        row
+        for row in DEVICE_STORE.list()
+        if row["server_id"] == server.id and bool(row["provisioned"])
+    ]
+    expected_map = {
+        str(row["client_public_key"]): str(row["client_address"])
+        for row in expected_rows
+    }
+
+    restored = 0
+    for public_key, client_address in expected_map.items():
+        if public_key not in active_peers:
+            _provision_peer(server, public_key, client_address)
+            restored += 1
+
+    removed = 0
+    for stale_key in sorted(active_peers - expected_map.keys()):
+        _revoke_peer(server, stale_key)
+        removed += 1
+
+    return ServerReconcileReport(
+        server_id=server.id,
+        status="reconciled",
+        restored_peers=restored,
+        removed_peers=removed,
+    )
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -367,6 +450,27 @@ def list_servers() -> list[Server]:
             server.id,
         ),
     )
+
+
+@app.post("/v1/servers/reconcile", response_model=list[ServerReconcileReport])
+def reconcile_servers(
+    authorization: Annotated[str | None, Header()] = None,
+) -> list[ServerReconcileReport]:
+    _require_control_plane_auth(authorization)
+    enabled = [server for server in SERVERS if server.enabled]
+    return [_reconcile_server(server) for server in enabled]
+
+
+@app.post("/v1/servers/{server_id}/reconcile", response_model=ServerReconcileReport)
+def reconcile_single_server(
+    server_id: str,
+    authorization: Annotated[str | None, Header()] = None,
+) -> ServerReconcileReport:
+    _require_control_plane_auth(authorization)
+    server = next((item for item in SERVERS if item.id == server_id and item.enabled), None)
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return _reconcile_server(server)
 
 
 @app.post("/v1/devices", response_model=DeviceRegistrationResponse)

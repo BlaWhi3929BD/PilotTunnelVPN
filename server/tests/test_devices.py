@@ -522,3 +522,101 @@ def test_register_device_gateway_failure_does_not_strand_new_device(monkeypatch)
     assert succeeded.json()["device_token"] is not None
     assert main.DEVICE_STORE.get("device-1234") is not None
 
+
+def test_reconcile_server_restores_missing_peers_and_removes_stale_peers(monkeypatch) -> None:
+    main.GATEWAY_AGENT_URL = "http://gateway-agent.test"
+    main.GATEWAY_AGENT_TOKEN = "gateway-token"
+    main.SERVERS[0].gateway_api_url = "http://gateway-agent.test"
+
+    stale_key = base64.b64encode(b"\x99" * 32).decode("ascii")
+    second_key = base64.b64encode(b"\x22" * 32).decode("ascii")
+    gateway_peers: set[str] = set()
+    calls: list[tuple[str, str, dict | None]] = []
+
+    class FakeGatewayResponse:
+        def __init__(self, status_code: int = 200, payload: dict | None = None):
+            self.status_code = status_code
+            self._payload = payload or {
+                "status": "ok",
+                "wireguard_available": True,
+                "peer_count": len(gateway_peers),
+                "peer_capacity": 240,
+                "capacity_remaining": 240 - len(gateway_peers),
+            }
+            self.text = "ok"
+
+        def json(self):
+            return self._payload
+
+    class FakeGatewayClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path):
+            return FakeGatewayResponse()
+
+        def request(self, method, path, *, headers, json=None):
+            calls.append((method, path, json))
+            if method == "GET" and path == "/v1/peers":
+                return FakeGatewayResponse(
+                    payload={"interface": "tunnelpilot0", "peers": sorted(gateway_peers)}
+                )
+            if method == "POST" and path == "/v1/peers" and json:
+                gateway_peers.add(json["public_key"])
+                return FakeGatewayResponse()
+            if method == "DELETE" and path.startswith("/v1/peers?public_key="):
+                from urllib.parse import unquote
+
+                encoded = path.split("public_key=", 1)[1]
+                gateway_peers.discard(unquote(encoded))
+                return FakeGatewayResponse()
+            return FakeGatewayResponse()
+
+    monkeypatch.setattr(main.httpx, "Client", FakeGatewayClient)
+
+    first = client.post("/v1/devices", json=registration(device_id="device-1111", public_key=VALID_PUBLIC_KEY))
+    second = client.post("/v1/devices", json=registration(device_id="device-2222", public_key=second_key))
+    assert first.status_code == 200
+    assert second.status_code == 200
+
+    # Simulate gateway losing device-1111 and having an orphan stale_key
+    gateway_peers.clear()
+    gateway_peers.add(second_key)
+    gateway_peers.add(stale_key)
+
+    reconcile = client.post("/v1/servers/reconcile")
+    assert reconcile.status_code == 200
+    reports = reconcile.json()
+    assert len(reports) == 1
+    assert reports[0]["server_id"] == "dev-1"
+    assert reports[0]["status"] == "reconciled"
+    assert reports[0]["restored_peers"] == 1
+    assert reports[0]["removed_peers"] == 1
+    assert gateway_peers == {VALID_PUBLIC_KEY, second_key}
+
+
+def test_reconcile_servers_requires_control_plane_token_when_configured() -> None:
+    main.CONTROL_PLANE_TOKEN = "secret-admin-token"
+
+    unauthorized = client.post("/v1/servers/reconcile")
+    authorized = client.post(
+        "/v1/servers/reconcile",
+        headers={"Authorization": "Bearer secret-admin-token"},
+    )
+
+    assert unauthorized.status_code == 401
+    assert authorized.status_code == 200
+    assert authorized.json()[0]["status"] == "skipped"
+
+
+def test_reconcile_single_server_not_found_returns_404() -> None:
+    response = client.post("/v1/servers/nonexistent-server/reconcile")
+    assert response.status_code == 404
+
+

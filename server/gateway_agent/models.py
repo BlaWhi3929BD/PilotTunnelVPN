@@ -26,6 +26,11 @@ class PeerResponse(BaseModel):
     allowed_ip: str
 
 
+class PeerListResponse(BaseModel):
+    interface: str
+    peers: list[str]
+
+
 class GatewayHealthResponse(BaseModel):
     status: str
     interface: str

@@ -4,7 +4,7 @@ import os
 
 from fastapi import FastAPI, Header, HTTPException, Query, status
 
-from .models import GatewayHealthResponse, PeerCreateRequest, PeerResponse
+from .models import GatewayHealthResponse, PeerCreateRequest, PeerListResponse, PeerResponse
 from .wireguard import WireGuardController
 
 app = FastAPI(title="TunnelPilot Gateway Agent", version="0.2.0")
@@ -51,6 +51,19 @@ def healthz() -> GatewayHealthResponse:
         peer_capacity=WG_MAX_PEERS,
         capacity_remaining=capacity_remaining,
     )
+
+
+@app.get("/v1/peers", response_model=PeerListResponse)
+def list_peers(
+    authorization: str | None = Header(default=None),
+) -> PeerListResponse:
+    _require_auth(authorization)
+    try:
+        peers = controller.list_peers()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    return PeerListResponse(interface=WG_INTERFACE, peers=peers)
 
 
 @app.post("/v1/peers", response_model=PeerResponse)

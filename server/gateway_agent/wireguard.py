@@ -59,9 +59,12 @@ class WireGuardController:
     def ensure_available(self) -> None:
         self._run([self.binary, "show", self.interface])
 
-    def peer_count(self) -> int:
+    def list_peers(self) -> list[str]:
         result = self._run([self.binary, "show", self.interface, "peers"])
-        return sum(1 for line in result.stdout.splitlines() if line.strip())
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def peer_count(self) -> int:
+        return len(self.list_peers())
 
     def add_peer(self, public_key: str, allowed_ip: str) -> None:
         public_key = validate_public_key(public_key)
