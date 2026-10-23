@@ -13,7 +13,12 @@ else
   echo "Error: gateway agent token not found. Start gateway agent first!" >&2
   exit 1
 fi
-SERVER_PUBKEY="$(sudo cat /etc/wireguard/tunnelpilot0-server_public.key)"
+PUBKEY_FILE="$REPO_ROOT/server/data/gateway-public.key"
+if [[ -f "$PUBKEY_FILE" ]]; then
+  SERVER_PUBKEY="$(cat "$PUBKEY_FILE")"
+else
+  SERVER_PUBKEY="$(sudo cat /etc/wireguard/tunnelpilot0-server_public.key)"
+fi
 
 # Detect USB tethering interface IP if present, otherwise default route IP
 ENDPOINT_IP="$(ip -4 addr show enp0s20f0u4 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 || true)"
@@ -21,8 +26,19 @@ if [[ -z "$ENDPOINT_IP" ]]; then
   ENDPOINT_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')"
 fi
 
+ADMIN_TOKEN_FILE="$REPO_ROOT/server/data/admin.token"
+if [[ ! -f "$ADMIN_TOKEN_FILE" ]]; then
+  mkdir -p "$REPO_ROOT/server/data"
+  umask 077
+  python3 -c "import secrets; print(secrets.token_hex(32))" > "$ADMIN_TOKEN_FILE"
+  chmod 600 "$ADMIN_TOKEN_FILE"
+fi
+ADMIN_TOKEN="$(cat "$ADMIN_TOKEN_FILE")"
+
 echo "Control Plane Host Endpoint for WireGuard: $ENDPOINT_IP"
 
+export TUNNELPILOT_CONTROL_PLANE_TOKEN="$ADMIN_TOKEN"
+export TUNNELPILOT_ALLOW_OPEN_REGISTRATION="true"
 export TUNNELPILOT_GATEWAY_AGENT_URL="http://127.0.0.1:8787"
 export TUNNELPILOT_GATEWAY_AGENT_TOKEN="$GATEWAY_TOKEN"
 export TUNNELPILOT_SERVER_ID="dev-lan-1"

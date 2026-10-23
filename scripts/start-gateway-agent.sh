@@ -15,6 +15,10 @@ chmod 600 "$TOKEN_FILE"
 # Keep /tmp path synced for backward compatibility with already-running scripts
 printf '%s\n' "$TOKEN" | sudo tee /tmp/tunnelpilot-gateway-agent-token >/dev/null
 sudo chmod 600 /tmp/tunnelpilot-gateway-agent-token
+if sudo test -f /etc/wireguard/tunnelpilot0-server_public.key; then
+  sudo cat /etc/wireguard/tunnelpilot0-server_public.key > "$REPO_ROOT/server/data/gateway-public.key"
+  chmod 600 "$REPO_ROOT/server/data/gateway-public.key"
+fi
 
 TARGET_UID="$(id -u)"
 TARGET_GID="$(id -g)"

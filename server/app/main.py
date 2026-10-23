@@ -241,11 +241,13 @@ def _require_admin_auth(authorization: str | None) -> None:
 
 
 def _require_control_plane_auth(authorization: str | None) -> None:
+    if ALLOW_OPEN_REGISTRATION:
+        return
     if CONTROL_PLANE_TOKEN is not None and CONTROL_PLANE_TOKEN.strip():
         if not _is_valid_admin_token(authorization):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
         return
-    if ENVIRONMENT == "production" and not ALLOW_OPEN_REGISTRATION:
+    if ENVIRONMENT == "production":
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Control plane enrollment token is required in production unless TUNNELPILOT_ALLOW_OPEN_REGISTRATION=true",
