@@ -46,6 +46,18 @@ class SecureIdentityStore(context: Context) {
         }
     }
 
+    fun resetIdentity(): String {
+        val newDeviceId = UUID.randomUUID().toString()
+        prefs.edit {
+            putString(KEY_DEVICE_ID, newDeviceId)
+            remove(KEY_PRIVATE_KEY_CIPHERTEXT)
+            remove(KEY_PRIVATE_KEY_IV)
+            remove(KEY_DEVICE_TOKEN_CIPHERTEXT)
+            remove(KEY_DEVICE_TOKEN_IV)
+        }
+        return newDeviceId
+    }
+
     private fun saveEncrypted(ciphertextKey: String, ivKey: String, value: String) {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, key())

@@ -2,374 +2,46 @@ package com.blawhi3929bd.tunnelpilot
 
 import android.app.Application
 import android.content.Intent
-import android.net.VpnService
 import androidx.lifecycle.AndroidViewModel
-import androidx.lifecycle.viewModelScope
-import com.blawhi3929bd.tunnelpilot.data.AppSettingsStore
 import com.blawhi3929bd.tunnelpilot.data.InstalledApp
-import com.blawhi3929bd.tunnelpilot.data.InstalledAppsRepository
-import com.blawhi3929bd.tunnelpilot.data.SecureConfigStore
-import com.blawhi3929bd.tunnelpilot.provisioning.ControlPlaneClient
 import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
-import com.blawhi3929bd.tunnelpilot.provisioning.SecureIdentityStore
-import com.blawhi3929bd.tunnelpilot.provisioning.WireGuardConfigFactory
-import com.wireguard.android.backend.BackendException
-import com.wireguard.android.backend.Tunnel
-import com.wireguard.config.Config
-import com.wireguard.crypto.TunnelPilotKeyGenerator
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
-import java.io.ByteArrayInputStream
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
-    private val appContext = application.applicationContext
-    private val manager = WireGuardManager(appContext)
-    private val configStore = SecureConfigStore(appContext)
-    private val settingsStore = AppSettingsStore(appContext)
-    private val identityStore = SecureIdentityStore(appContext)
-    private val installedAppsRepository = InstalledAppsRepository(appContext)
-    private val operationMutex = Mutex()
+    private val controller = TunnelPilotController.getInstance(application)
 
-    private val _state = MutableStateFlow<VpnState>(VpnState.Disconnected)
-    val state: StateFlow<VpnState> = _state.asStateFlow()
+    val state: StateFlow<VpnState> = controller.state
+    val configPresent: StateFlow<Boolean> = controller.configPresent
+    val installedApps: StateFlow<List<InstalledApp>> = controller.installedApps
+    val selectedApps: StateFlow<Set<String>> = controller.selectedApps
+    val routingMode: StateFlow<RoutingMode> = controller.routingMode
+    val reconnectRequired: StateFlow<Boolean> = controller.reconnectRequired
+    val controlPlaneUrl: StateFlow<String> = controller.controlPlaneUrl
+    val provisioningState: StateFlow<ProvisioningState> = controller.provisioningState
 
-    private val _configPresent = MutableStateFlow(configStore.load() != null)
-    val configPresent: StateFlow<Boolean> = _configPresent.asStateFlow()
+    fun requiredVpnPermissionIntent(): Intent? = controller.requiredVpnPermissionIntent()
 
-    private val _installedApps = MutableStateFlow<List<InstalledApp>>(emptyList())
-    val installedApps: StateFlow<List<InstalledApp>> = _installedApps.asStateFlow()
+    fun refreshInstalledApps() = controller.refreshInstalledApps()
 
-    private val _selectedApps = MutableStateFlow(settingsStore.getSelectedApps())
-    val selectedApps: StateFlow<Set<String>> = _selectedApps.asStateFlow()
+    fun setRoutingMode(mode: RoutingMode) = controller.setRoutingMode(mode)
 
-    private val _routingMode = MutableStateFlow(settingsStore.getRoutingMode())
-    val routingMode: StateFlow<RoutingMode> = _routingMode.asStateFlow()
+    fun toggleApp(packageName: String) = controller.toggleApp(packageName)
 
-    private val _reconnectRequired = MutableStateFlow(false)
-    val reconnectRequired: StateFlow<Boolean> = _reconnectRequired.asStateFlow()
+    fun setControlPlaneUrl(url: String) = controller.setControlPlaneUrl(url)
 
-    private val _controlPlaneUrl = MutableStateFlow(settingsStore.getControlPlaneUrl())
-    val controlPlaneUrl: StateFlow<String> = _controlPlaneUrl.asStateFlow()
+    fun provision() = controller.provision()
 
-    private val _provisioningState = MutableStateFlow<ProvisioningState>(ProvisioningState.NotConfigured)
-    val provisioningState: StateFlow<ProvisioningState> = _provisioningState.asStateFlow()
+    fun rotateDeviceKey() = controller.rotateDeviceKey()
 
-    private var statsJob: Job? = null
+    fun resetIdentity() = controller.resetIdentity()
 
-    init {
-        refreshInstalledApps()
-    }
+    fun setConfig(rawConfig: String): Result<Unit> = controller.setConfig(rawConfig)
 
-    fun requiredVpnPermissionIntent(): Intent? = VpnService.prepare(appContext)
+    fun clearConfig() = controller.clearConfig()
 
-    fun refreshInstalledApps() {
-        viewModelScope.launch(Dispatchers.Default) {
-            _installedApps.value = installedAppsRepository.getLaunchableApps()
-        }
-    }
+    fun connect() = controller.connect()
 
-    fun setRoutingMode(mode: RoutingMode) {
-        _routingMode.value = mode
-        settingsStore.setRoutingMode(mode)
-        markRoutingChanged()
-    }
+    fun disconnect() = controller.disconnect()
 
-    fun toggleApp(packageName: String) {
-        _selectedApps.value = buildSet {
-            addAll(_selectedApps.value)
-            if (!add(packageName)) remove(packageName)
-        }
-        settingsStore.setSelectedApps(_selectedApps.value)
-        markRoutingChanged()
-    }
-
-    fun setControlPlaneUrl(url: String) {
-        _controlPlaneUrl.value = url
-        settingsStore.setControlPlaneUrl(url)
-        if (_provisioningState.value is ProvisioningState.Error) {
-            _provisioningState.value = ProvisioningState.NotConfigured
-        }
-    }
-
-    fun provision() {
-        if (_state.value.isActive()) {
-            _provisioningState.value = ProvisioningState.Error("Disconnect the VPN before provisioning a new configuration")
-            return
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            operationMutex.withLock {
-                _provisioningState.value = ProvisioningState.Provisioning
-                runCatching {
-                    val privateKey = identityStore.loadPrivateKey() ?: run {
-                        val generated = TunnelPilotKeyGenerator.generatePrivateKey().toBase64()
-                        identityStore.savePrivateKey(generated)
-                        generated
-                    }
-                    val privateKeyObject = com.wireguard.crypto.Key.fromBase64(privateKey)
-                    val publicKey = TunnelPilotKeyGenerator.generatePublicKey(privateKeyObject).toBase64()
-                    val deviceId = identityStore.getOrCreateDeviceId()
-
-                    val baseUrl = _controlPlaneUrl.value.trim()
-                    require(baseUrl.isNotBlank()) { "Control plane URL is required" }
-
-                    val registration = ControlPlaneClient(baseUrl).registerDevice(
-                        deviceId = deviceId,
-                        publicKey = publicKey,
-                        appVersion = BuildConfig.VERSION_NAME,
-                        deviceToken = identityStore.loadDeviceToken(),
-                    )
-                    registration.deviceToken?.let(identityStore::saveDeviceToken)
-
-                    val config = WireGuardConfigFactory.create(
-                        privateKey = privateKey,
-                        clientAddress = registration.clientAddress,
-                        server = registration.server,
-                    )
-                    Config.parse(ByteArrayInputStream(config.toByteArray(Charsets.UTF_8)))
-                    configStore.save(config)
-                    _configPresent.value = true
-                    _reconnectRequired.value = false
-                    _provisioningState.value = ProvisioningState.Provisioned(
-                        deviceId = registration.deviceId,
-                        clientAddress = registration.clientAddress,
-                    )
-                }.onFailure { error ->
-                    _provisioningState.value = ProvisioningState.Error(
-                        error.message ?: "Unable to provision the device",
-                    )
-                }
-            }
-        }
-    }
-
-    fun rotateDeviceKey() {
-        if (_state.value.isActive()) {
-            _provisioningState.value = ProvisioningState.Error("Disconnect the VPN before rotating the client key")
-            return
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            operationMutex.withLock {
-                _provisioningState.value = ProvisioningState.Provisioning
-                runCatching {
-                    val deviceId = identityStore.getOrCreateDeviceId()
-                    val deviceToken = identityStore.loadDeviceToken()
-                        ?: error("Device authentication is required before key rotation")
-                    val oldPrivateKey = identityStore.loadPrivateKey()
-                        ?: error("The current client private key is missing")
-                    val oldPublicKey = TunnelPilotKeyGenerator.generatePublicKey(
-                        com.wireguard.crypto.Key.fromBase64(oldPrivateKey),
-                    ).toBase64()
-                    val newPrivateKey = TunnelPilotKeyGenerator.generatePrivateKey().toBase64()
-                    val newPublicKey = TunnelPilotKeyGenerator.generatePublicKey(
-                        com.wireguard.crypto.Key.fromBase64(newPrivateKey),
-                    ).toBase64()
-                    val baseUrl = _controlPlaneUrl.value.trim()
-                    require(baseUrl.isNotBlank()) { "Control plane URL is required" }
-
-                    val rotation = ControlPlaneClient(baseUrl).rotateDevice(
-                        deviceId = deviceId,
-                        publicKey = newPublicKey,
-                        appVersion = BuildConfig.VERSION_NAME,
-                        deviceToken = deviceToken,
-                    )
-
-                    try {
-                        val config = WireGuardConfigFactory.create(
-                            privateKey = newPrivateKey,
-                            clientAddress = rotation.clientAddress,
-                            server = rotation.server,
-                        )
-                        Config.parse(ByteArrayInputStream(config.toByteArray(Charsets.UTF_8)))
-                        identityStore.savePrivateKey(newPrivateKey)
-                        configStore.save(config)
-                        _configPresent.value = true
-                        _reconnectRequired.value = false
-                        _provisioningState.value = ProvisioningState.Provisioned(
-                            deviceId = rotation.deviceId,
-                            clientAddress = rotation.clientAddress,
-                        )
-                    } catch (localFailure: Exception) {
-                        runCatching {
-                            ControlPlaneClient(baseUrl).rotateDevice(
-                                deviceId = deviceId,
-                                publicKey = oldPublicKey,
-                                appVersion = BuildConfig.VERSION_NAME,
-                                deviceToken = deviceToken,
-                            )
-                        }
-                        runCatching { identityStore.savePrivateKey(oldPrivateKey) }
-                        throw localFailure
-                    }
-                }.onFailure { error ->
-                    _provisioningState.value = ProvisioningState.Error(
-                        error.message ?: "Unable to rotate the device key",
-                    )
-                }
-            }
-        }
-    }
-
-    fun setConfig(rawConfig: String): Result<Unit> = runCatching {
-        require(rawConfig.contains("[Interface]", ignoreCase = true)) {
-            "Config must contain an [Interface] section"
-        }
-        require(rawConfig.contains("[Peer]", ignoreCase = true)) {
-            "Config must contain at least one [Peer] section"
-        }
-        Config.parse(ByteArrayInputStream(rawConfig.toByteArray(Charsets.UTF_8)))
-        configStore.save(rawConfig.trim() + "\n")
-        _configPresent.value = true
-    }
-
-    fun clearConfig() {
-        disconnect()
-        viewModelScope.launch(Dispatchers.IO) {
-            operationMutex.withLock {
-                val deviceId = identityStore.getOrCreateDeviceId()
-                val token = identityStore.loadDeviceToken()
-                val baseUrl = _controlPlaneUrl.value.trim()
-                if (token != null && baseUrl.isNotBlank()) {
-                    runCatching {
-                        ControlPlaneClient(baseUrl).revokeDevice(deviceId, token)
-                    }
-                }
-                configStore.clear()
-                identityStore.clearDeviceToken()
-                identityStore.clearPrivateKey()
-                _configPresent.value = false
-                _reconnectRequired.value = false
-                _provisioningState.value = ProvisioningState.NotConfigured
-            }
-        }
-    }
-
-    fun connect() {
-        if (!_configPresent.value) {
-            setError("Import a WireGuard configuration first")
-            return
-        }
-        if (_routingMode.value == RoutingMode.SELECTED_APPS && _selectedApps.value.isEmpty()) {
-            setError("Select at least one app for Selected apps mode")
-            return
-        }
-        if (requiredVpnPermissionIntent() != null) {
-            setError("Android VPN permission is required")
-            return
-        }
-
-        viewModelScope.launch(Dispatchers.IO) {
-            operationMutex.withLock {
-                performConnect()
-            }
-        }
-    }
-
-    fun disconnect() {
-        viewModelScope.launch(Dispatchers.IO) {
-            operationMutex.withLock {
-                disconnectAndWait()
-            }
-        }
-    }
-
-    fun applyRoutingChanges() {
-        viewModelScope.launch(Dispatchers.IO) {
-            operationMutex.withLock {
-                if (!_state.value.isActive()) return@withLock
-                disconnectAndWait()
-                if (_state.value !is VpnState.Disconnected) return@withLock
-                performConnect()
-            }
-        }
-    }
-
-    private suspend fun disconnectAndWait() {
-        statsJob?.cancel()
-        statsJob = null
-        runCatching {
-            manager.disconnect()
-            waitForBackendState(Tunnel.State.DOWN)
-        }.onSuccess {
-            _state.value = VpnState.Disconnected
-            _reconnectRequired.value = false
-        }.onFailure {
-            setError(it.message ?: "Unable to disconnect")
-        }
-    }
-
-    private suspend fun waitForBackendState(target: Tunnel.State, timeoutMs: Long = 2_000) {
-        var waitedMs = 0L
-        while (manager.currentState() != target && waitedMs < timeoutMs) {
-            delay(50)
-            waitedMs += 50
-        }
-        check(manager.currentState() == target) {
-            "WireGuard backend did not reach ${target.name} state in time"
-        }
-    }
-
-    private suspend fun performConnect() {
-        val rawConfig = configStore.load()
-        if (rawConfig == null) {
-            setError("The saved configuration could not be decrypted")
-            return
-        }
-
-        _state.value = VpnState.Connecting
-        try {
-            val installed = _installedApps.value.asSequence().map { it.packageName }.toSet()
-            val selected = _selectedApps.value.intersect(installed)
-            val config = if (_routingMode.value == RoutingMode.SELECTED_APPS) {
-                ConfigEditor.withIncludedApplications(rawConfig, selected)
-            } else {
-                ConfigEditor.withIncludedApplications(rawConfig, emptySet())
-            }
-            manager.connect(config)
-            waitForBackendState(Tunnel.State.UP)
-            _reconnectRequired.value = false
-            updateStats()
-            startStatsPolling()
-        } catch (e: BackendException) {
-            setError(e.message ?: "WireGuard backend error")
-        } catch (e: Exception) {
-            setError(e.message ?: "Unable to connect")
-        }
-    }
-
-    private fun startStatsPolling() {
-        statsJob?.cancel()
-        statsJob = viewModelScope.launch(Dispatchers.IO) {
-            while (_state.value is VpnState.Connected) {
-                delay(1000)
-                updateStats()
-            }
-        }
-    }
-
-    private fun updateStats() {
-        val stats = manager.statistics() ?: return
-        _state.value = VpnState.Connected(
-            rxBytes = stats.totalRx(),
-            txBytes = stats.totalTx(),
-        )
-    }
-
-    private fun markRoutingChanged() {
-        if (_state.value is VpnState.Connected) _reconnectRequired.value = true
-    }
-
-    private fun setError(message: String) {
-        statsJob?.cancel()
-        statsJob = null
-        _state.value = VpnState.Error(message)
-    }
+    fun applyRoutingChanges() = controller.applyRoutingChanges()
 }
