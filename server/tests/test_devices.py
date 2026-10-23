@@ -257,3 +257,147 @@ def test_revoke_device_removes_provisioned_peer(monkeypatch) -> None:
     assert revoked.status_code == 200
     assert "device-1234" not in main.DEVICES
     assert ("DELETE", f"/v1/peers?public_key={VALID_PUBLIC_KEY[:-1]}%3D") in calls
+
+
+def test_rotate_device_key_requires_device_token_and_replaces_gateway_peer(monkeypatch) -> None:
+    main.GATEWAY_AGENT_URL = "http://gateway-agent.test"
+    main.GATEWAY_AGENT_TOKEN = "gateway-token"
+    main.SERVERS[0].gateway_api_url = "http://gateway-agent.test"
+
+    new_public_key = base64.b64encode(bytes(range(64, 96))).decode()
+    calls: list[tuple[str, str, dict[str, str] | None, dict[str, str]]] = []
+
+    class FakeResponse:
+        status_code = 200
+        text = "ok"
+
+        def json(self):
+            return {
+                "status": "ok",
+                "wireguard_available": True,
+                "peer_count": 1,
+                "peer_capacity": 240,
+                "capacity_remaining": 239,
+            }
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path):
+            return FakeResponse()
+
+        def request(self, method, path, *, headers, json=None):
+            calls.append((method, path, json, headers))
+            return FakeResponse()
+
+    monkeypatch.setattr(main.httpx, "Client", FakeClient)
+
+    created = client.post("/v1/devices", json=registration())
+    token = created.json()["device_token"]
+
+    unauthorized = client.post(
+        "/v1/devices/device-1234/rotate",
+        json={"client_public_key": new_public_key, "app_version": "0.2.0"},
+    )
+    rotated = client.post(
+        "/v1/devices/device-1234/rotate",
+        json={"client_public_key": new_public_key, "app_version": "0.2.0"},
+        headers={"X-Device-Token": token},
+    )
+
+    assert unauthorized.status_code == 401
+    assert rotated.status_code == 200
+    assert rotated.json()["status"] == "rotated"
+    assert rotated.json()["client_address"] == "10.67.0.2/32"
+    record = main.DEVICE_STORE.get("device-1234")
+    assert record["client_public_key"] == new_public_key
+    assert calls[-2][0:2] == ("DELETE", f"/v1/peers?public_key={VALID_PUBLIC_KEY[:-1]}%3D")
+    assert calls[-1][0:2] == ("POST", "/v1/peers")
+
+
+def test_rotate_device_key_rejects_key_used_by_another_device(monkeypatch) -> None:
+    main.GATEWAY_AGENT_URL = None
+    first = client.post("/v1/devices", json=registration())
+    second_key = ANOTHER_PUBLIC_KEY
+    second = client.post("/v1/devices", json=registration(device_id="device-5678", public_key=second_key))
+    token = first.json()["device_token"]
+
+    response = client.post(
+        "/v1/devices/device-1234/rotate",
+        json={"client_public_key": second_key, "app_version": "0.2.0"},
+        headers={"X-Device-Token": token},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert response.status_code == 409
+    assert "another device_id" in response.json()["detail"]
+
+
+def test_register_device_gateway_failure_does_not_strand_new_device(monkeypatch) -> None:
+    main.GATEWAY_AGENT_URL = "http://gateway-agent.test"
+    main.GATEWAY_AGENT_TOKEN = "gateway-token"
+    main.SERVERS[0].gateway_api_url = "http://gateway-agent.test"
+
+    should_fail = True
+
+    class FlakyResponse:
+        def __init__(self, status_code: int, text: str = "ok"):
+            self.status_code = status_code
+            self.text = text
+
+        def json(self):
+            return {
+                "status": "ok",
+                "wireguard_available": True,
+                "peer_count": 0,
+                "peer_capacity": 240,
+                "capacity_remaining": 240,
+            }
+
+    class FlakyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path):
+            return FlakyResponse(200)
+
+        def request(self, method, path, *, headers, json=None):
+            if should_fail and method == "POST" and path == "/v1/peers":
+                return FlakyResponse(502, "Gateway error")
+            return FlakyResponse(200)
+
+        def delete(self, path, *, headers=None):
+            return FlakyResponse(200)
+
+    monkeypatch.setattr(main.httpx, "Client", FlakyClient)
+
+    # 1. First registration attempt fails on gateway provisioning
+    failed = client.post("/v1/devices", json=registration())
+    assert failed.status_code == 502
+
+    # 2. Assert device was NOT stranded in DB or cache
+    assert main.DEVICE_STORE.get("device-1234") is None
+    assert "device-1234" not in main.DEVICES
+
+    # 3. Gateway is restored; repeat registration with same device ID succeeds as new enrollment
+    should_fail = False
+    succeeded = client.post("/v1/devices", json=registration())
+    assert succeeded.status_code == 200
+    assert succeeded.json()["status"] == "accepted"
+    assert succeeded.json()["device_token"] is not None
+    assert main.DEVICE_STORE.get("device-1234") is not None
+

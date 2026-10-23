@@ -86,6 +86,24 @@ class DeviceRevocationResponse(BaseModel):
     device_id: str
 
 
+class DeviceRotationRequest(BaseModel):
+    client_public_key: str
+    app_version: str = Field(min_length=1, max_length=32)
+
+    @field_validator("client_public_key")
+    @classmethod
+    def validate_client_public_key(cls, value: str) -> str:
+        return _validate_public_key(value)
+
+
+class DeviceRotationResponse(BaseModel):
+    status: str
+    device_id: str
+    client_address: str
+    provisioned: bool
+    server: Server
+
+
 SERVERS = [
     Server(
         id=SERVER_ID,
@@ -312,6 +330,26 @@ def _revoke_peer(server: Server, public_key: str) -> None:
         raise HTTPException(status_code=502, detail=detail)
 
 
+def _rotate_peer(server: Server, old_public_key: str, new_public_key: str, client_address: str) -> None:
+    if old_public_key == new_public_key:
+        return
+    _revoke_peer(server, old_public_key)
+    try:
+        _provision_peer(server, new_public_key, client_address)
+    except Exception:
+        run_error = None
+        try:
+            _provision_peer(server, old_public_key, client_address)
+        except Exception as exc:
+            run_error = exc
+        if run_error is not None:
+            raise HTTPException(
+                status_code=502,
+                detail="Gateway peer rotation failed and rollback also failed",
+            ) from run_error
+        raise
+
+
 @app.get("/healthz")
 def healthz() -> dict[str, str]:
     return {"status": "ok"}
@@ -384,23 +422,36 @@ def register_device(
         client_address = existing.client_address
         created_at = existing.created_at
 
-    # wg set is idempotent and repairs the peer if the gateway lost it.
-    if _gateway_url(server):
-        _provision_peer(server, registration.client_public_key, client_address)
-        provisioned = True
-    else:
-        provisioned = existing.provisioned
+    try:
+        # wg set is idempotent and repairs the peer if the gateway lost it.
+        if _gateway_url(server):
+            _provision_peer(server, registration.client_public_key, client_address)
+            provisioned = True
+        else:
+            provisioned = existing.provisioned
 
-    now = _utc_now()
-    DEVICE_STORE.update(
-        device_id=registration.device_id,
-        app_version=registration.app_version,
-        last_seen_at=now.isoformat(),
-        provisioned=provisioned,
-    )
-    record = _load_record(registration.device_id)
-    if record is None:
-        raise HTTPException(status_code=500, detail="Device state could not be persisted")
+        now = _utc_now()
+        DEVICE_STORE.update(
+            device_id=registration.device_id,
+            app_version=registration.app_version,
+            last_seen_at=now.isoformat(),
+            provisioned=provisioned,
+        )
+        record = _load_record(registration.device_id)
+        if record is None:
+            raise HTTPException(status_code=500, detail="Device state could not be persisted")
+    except Exception:
+        if issued_token is not None:
+            # If initial provisioning failed, the client never receives the issued token.
+            # Roll back newly created storage record and cache so the device is not stranded in a 401 lockout.
+            DEVICE_STORE.delete(registration.device_id)
+            DEVICES.pop(registration.device_id, None)
+            if _gateway_url(server):
+                try:
+                    _revoke_peer(server, registration.client_public_key)
+                except Exception:
+                    pass
+        raise
 
     return DeviceRegistrationResponse(
         status="accepted",
@@ -410,6 +461,80 @@ def register_device(
         provisioned=record.provisioned,
         registered_at=created_at,
         device_token=issued_token,
+    )
+
+
+@app.post("/v1/devices/{device_id}/rotate", response_model=DeviceRotationResponse)
+def rotate_device_key(
+    device_id: str,
+    rotation: DeviceRotationRequest,
+    x_device_token: Annotated[str | None, Header()] = None,
+) -> DeviceRotationResponse:
+    record = _load_record(device_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    _require_device_auth(record, x_device_token)
+
+    if rotation.client_public_key == record.client_public_key:
+        server = next((item for item in SERVERS if item.id == record.server_id and item.enabled), None)
+        if server is None:
+            raise HTTPException(status_code=503, detail="Assigned VPN server is unavailable")
+        return DeviceRotationResponse(
+            status="unchanged",
+            device_id=record.device_id,
+            client_address=record.client_address,
+            provisioned=record.provisioned,
+            server=server,
+        )
+
+    conflicting = DEVICE_STORE.find_by_public_key(rotation.client_public_key)
+    if conflicting is not None and conflicting["device_id"] != device_id:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="client_public_key is already registered to another device_id",
+        )
+
+    server = next((item for item in SERVERS if item.id == record.server_id and item.enabled), None)
+    if server is None:
+        raise HTTPException(status_code=503, detail="Assigned VPN server is unavailable")
+    if not _gateway_url(server):
+        raise HTTPException(status_code=503, detail="Gateway agent is not configured")
+
+    old_public_key = record.client_public_key
+    new_public_key = rotation.client_public_key
+    client_address = record.client_address
+    _rotate_peer(server, old_public_key, new_public_key, client_address)
+
+    try:
+        DEVICE_STORE.update(
+            device_id=device_id,
+            client_public_key=new_public_key,
+            app_version=rotation.app_version,
+            last_seen_at=_utc_now().isoformat(),
+            provisioned=True,
+        )
+    except Exception as exc:
+        try:
+            _revoke_peer(server, new_public_key)
+            _provision_peer(server, old_public_key, client_address)
+        except Exception as rollback_error:
+            raise HTTPException(
+                status_code=502,
+                detail="Device state update failed and gateway rollback also failed",
+            ) from rollback_error
+        raise HTTPException(status_code=503, detail="Device state update failed; rotation rolled back") from exc
+
+    updated = _load_record(device_id)
+    if updated is None:
+        raise HTTPException(status_code=500, detail="Device state could not be loaded after rotation")
+
+    return DeviceRotationResponse(
+        status="rotated",
+        device_id=updated.device_id,
+        client_address=updated.client_address,
+        provisioned=updated.provisioned,
+        server=server,
     )
 
 

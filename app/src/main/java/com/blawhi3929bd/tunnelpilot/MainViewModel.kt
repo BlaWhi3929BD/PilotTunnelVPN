@@ -150,6 +150,74 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun rotateDeviceKey() {
+        if (_state.value.isActive()) {
+            _provisioningState.value = ProvisioningState.Error("Disconnect the VPN before rotating the client key")
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            operationMutex.withLock {
+                _provisioningState.value = ProvisioningState.Provisioning
+                runCatching {
+                    val deviceId = identityStore.getOrCreateDeviceId()
+                    val deviceToken = identityStore.loadDeviceToken()
+                        ?: error("Device authentication is required before key rotation")
+                    val oldPrivateKey = identityStore.loadPrivateKey()
+                        ?: error("The current client private key is missing")
+                    val oldPublicKey = TunnelPilotKeyGenerator.generatePublicKey(
+                        com.wireguard.crypto.Key.fromBase64(oldPrivateKey),
+                    ).toBase64()
+                    val newPrivateKey = TunnelPilotKeyGenerator.generatePrivateKey().toBase64()
+                    val newPublicKey = TunnelPilotKeyGenerator.generatePublicKey(
+                        com.wireguard.crypto.Key.fromBase64(newPrivateKey),
+                    ).toBase64()
+                    val baseUrl = _controlPlaneUrl.value.trim()
+                    require(baseUrl.isNotBlank()) { "Control plane URL is required" }
+
+                    val rotation = ControlPlaneClient(baseUrl).rotateDevice(
+                        deviceId = deviceId,
+                        publicKey = newPublicKey,
+                        appVersion = BuildConfig.VERSION_NAME,
+                        deviceToken = deviceToken,
+                    )
+
+                    try {
+                        val config = WireGuardConfigFactory.create(
+                            privateKey = newPrivateKey,
+                            clientAddress = rotation.clientAddress,
+                            server = rotation.server,
+                        )
+                        Config.parse(ByteArrayInputStream(config.toByteArray(Charsets.UTF_8)))
+                        identityStore.savePrivateKey(newPrivateKey)
+                        configStore.save(config)
+                        _configPresent.value = true
+                        _reconnectRequired.value = false
+                        _provisioningState.value = ProvisioningState.Provisioned(
+                            deviceId = rotation.deviceId,
+                            clientAddress = rotation.clientAddress,
+                        )
+                    } catch (localFailure: Exception) {
+                        runCatching {
+                            ControlPlaneClient(baseUrl).rotateDevice(
+                                deviceId = deviceId,
+                                publicKey = oldPublicKey,
+                                appVersion = BuildConfig.VERSION_NAME,
+                                deviceToken = deviceToken,
+                            )
+                        }
+                        runCatching { identityStore.savePrivateKey(oldPrivateKey) }
+                        throw localFailure
+                    }
+                }.onFailure { error ->
+                    _provisioningState.value = ProvisioningState.Error(
+                        error.message ?: "Unable to rotate the device key",
+                    )
+                }
+            }
+        }
+    }
+
     fun setConfig(rawConfig: String): Result<Unit> = runCatching {
         require(rawConfig.contains("[Interface]", ignoreCase = true)) {
             "Config must contain an [Interface] section"

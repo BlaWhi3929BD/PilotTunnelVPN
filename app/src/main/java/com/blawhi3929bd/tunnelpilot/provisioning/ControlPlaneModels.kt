@@ -8,6 +8,14 @@ data class RegisteredServer(
     val port: Int,
 )
 
+data class RotationResult(
+    val status: String,
+    val deviceId: String,
+    val clientAddress: String,
+    val provisioned: Boolean,
+    val server: RegisteredServer,
+)
+
 data class RegistrationResult(
     val deviceId: String,
     val clientAddress: String,

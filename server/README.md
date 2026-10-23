@@ -1,38 +1,19 @@
 # TunnelPilot control plane + gateway agent
 
-The server side now has two deliberately separate services:
+The server side has two deliberately separate services:
 
-- **Control plane**: device registration, persistent address allocation, device authentication, server health selection, and peer provisioning/revocation orchestration.
+- **Control plane**: persistent device registration, address allocation, device authentication, server selection, peer provisioning/revocation, and authenticated WireGuard key rotation.
 - **Gateway agent**: a small privileged process that is allowed to execute WireGuard peer changes on the gateway host.
 
-The control plane never receives a client private key and never needs the gateway private key.
-
-## Persistent state
-
-Control-plane device state is stored in SQLite. The default database path is:
-
-```text
-server/data/tunnelpilot.db
-```
-
-Override it with:
-
-```text
-TUNNELPILOT_DATABASE_PATH=/path/to/tunnelpilot.db
-```
-
-The database file is ignored by Git. Back it up as part of production server operations.
+The control plane never receives a client private key and never needs the gateway private key. Device state is persisted in SQLite for this development milestone.
 
 ## Control plane API
 
 - `GET /healthz` — liveness.
-- `GET /v1/servers` — enabled WireGuard gateways with live health/capacity information.
-- `POST /v1/devices` — creates or re-authenticates a device, allocates a persistent `/32`, selects a healthy gateway, and idempotently provisions its peer.
-- `DELETE /v1/devices/{device_id}` — admin-only revocation and peer removal.
-
-The first successful device registration returns an opaque device token. Store it securely and send it as `X-Device-Token` on later registrations. The Android client stores this token encrypted with Android Keystore.
-
-The gateway mutation is retried on every authenticated re-registration, so a control-plane restart does not silently orphan a device whose peer disappeared from the gateway.
+- `GET /v1/servers` — enabled WireGuard gateways with live health/capacity data.
+- `POST /v1/devices` — first registration allocates a `/32`, issues a device token, and provisions the gateway peer. Existing devices must authenticate with `X-Device-Token`; registration is idempotent and repairs a missing gateway peer.
+- `POST /v1/devices/{device_id}/rotate` — authenticated WireGuard public-key rotation while preserving the device ID, VPN address, server assignment, and device token.
+- `DELETE /v1/devices/{device_id}` — administrative revocation using the control-plane Bearer token; removes the gateway peer and deletes the device state.
 
 ### Environment
 
@@ -43,16 +24,13 @@ TUNNELPILOT_GATEWAY_AGENT_TOKEN=long-random-secret
 TUNNELPILOT_DATABASE_PATH=server/data/tunnelpilot.db
 TUNNELPILOT_VPN_ADDRESS_POOL=10.67.0.0/24
 TUNNELPILOT_VPN_GATEWAY_ADDRESS=10.67.0.1
-TUNNELPILOT_SERVER_ID=dev-lan-1
-TUNNELPILOT_SERVER_REGION=dev-lan
-TUNNELPILOT_SERVER_HOSTNAME=192.168.1.85
-TUNNELPILOT_SERVER_PUBLIC_KEY=<gateway-public-key>
-TUNNELPILOT_SERVER_PORT=51820
 ```
 
-### Security boundary
+The gateway agent URL can also be set per server with the `gateway_api_url` field in the server catalog.
 
-`X-Device-Token` authenticates the device to the control plane after initial enrollment. `Authorization: Bearer ...` remains reserved for control-plane administration such as revocation. Use HTTPS in any deployment where these credentials cross an untrusted network.
+## Device authentication
+
+On first registration the control plane returns a random device token once. The Android client stores it encrypted with Android Keystore and sends it as `X-Device-Token` for subsequent provisioning and key rotation. The control plane stores only a SHA-256 hash of the token.
 
 ## Gateway agent
 
@@ -61,6 +39,7 @@ Run the agent on the WireGuard gateway host where `wg` can access the target int
 ```bash
 export TUNNELPILOT_GATEWAY_AGENT_TOKEN='replace-me'
 export TUNNELPILOT_WG_INTERFACE=tunnelpilot0
+export TUNNELPILOT_WG_MAX_PEERS=240
 uvicorn server.gateway_agent.app:app --host 127.0.0.1 --port 8787
 ```
 
@@ -76,6 +55,13 @@ The mutation endpoint runs a fixed `wg set ... peer ...` command built from vali
 
 Do not expose the gateway agent directly to the public internet. Keep it on localhost, a private management network, or behind a mutually authenticated proxy. The token is an additional application-level control, not a replacement for network isolation.
 
+## Development helper scripts
+
+For local development and testing:
+- `./scripts/start-gateway-agent.sh`: generates a temporary gateway token and starts the Gateway Agent on `127.0.0.1:8787`.
+- `./scripts/start-control-plane.sh`: reads the gateway token and server public key, detects the gateway endpoint IP, and starts the Control Plane on `0.0.0.0:8000`.
+- `./scripts/fix-gateway-forwarding.sh`: configures `sysctl` IP forwarding, NAT `MASQUERADE`, and TCP MSS clamping (`--clamp-mss-to-pmtu`) to prevent packet drops on HTTPS traffic.
+
 ## Tests
 
 ```bash
@@ -85,9 +71,10 @@ pytest server/tests -q
 
 ## Still required before production
 
-- safe peer rotation with an explicit old/new key transition
-- durable multi-server inventory rather than environment-only catalog configuration
+- transactional multi-server allocation and durable deployment database
+- real device identity binding / attestation where appropriate
+- short-lived or rotatable device credentials
+- gateway health/capacity scoring improvements
 - rate limiting and audit-safe logs
 - TLS / mTLS for control-plane-to-gateway traffic
 - system service supervision on gateways
-- backup/restore procedure for the control-plane database

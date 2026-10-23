@@ -58,6 +58,51 @@ class ControlPlaneClient(
         }
     }
 
+
+    fun rotateDevice(
+        deviceId: String,
+        publicKey: String,
+        appVersion: String,
+        deviceToken: String,
+    ): RotationResult {
+        require(deviceId.isNotBlank()) { "Device ID is required" }
+        require(publicKey.isNotBlank()) { "WireGuard public key is required" }
+        require(appVersion.isNotBlank()) { "App version is required" }
+        require(deviceToken.isNotBlank()) { "Device token is required" }
+
+        val url = endpoint("/v1/devices/$deviceId/rotate")
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            connectTimeout = connectTimeoutMs
+            readTimeout = readTimeoutMs
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Accept", "application/json")
+            setRequestProperty("X-Device-Token", deviceToken)
+        }
+
+        return try {
+            val payload = JSONObject()
+                .put("client_public_key", publicKey)
+                .put("app_version", appVersion)
+                .toString()
+
+            connection.outputStream.bufferedWriter(Charsets.UTF_8).use { writer ->
+                writer.write(payload)
+            }
+
+            val responseCode = connection.responseCode
+            val responseBody = readResponseBody(connection, responseCode)
+            if (responseCode !in 200..299) {
+                throw IllegalStateException(parseError(responseBody, responseCode))
+            }
+
+            parseRotation(responseBody)
+        } finally {
+            connection.disconnect()
+        }
+    }
+
     private fun endpoint(path: String): URL {
         val normalized = baseUrl.trim().removeSuffix("/")
         require(normalized.isNotBlank()) { "Control plane URL is required" }
@@ -77,6 +122,25 @@ class ControlPlaneClient(
     private fun parseError(body: String, responseCode: Int): String {
         val detail = runCatching { JSONObject(body).optString("detail") }.getOrNull().orEmpty()
         return detail.ifBlank { "Control plane request failed (HTTP $responseCode)" }
+    }
+
+
+    private fun parseRotation(body: String): RotationResult {
+        val json = JSONObject(body)
+        val serverJson = json.getJSONObject("server")
+        return RotationResult(
+            status = json.getString("status"),
+            deviceId = json.getString("device_id"),
+            clientAddress = json.getString("client_address"),
+            provisioned = json.getBoolean("provisioned"),
+            server = RegisteredServer(
+                id = serverJson.getString("id"),
+                region = serverJson.getString("region"),
+                hostname = serverJson.getString("hostname"),
+                publicKey = serverJson.getString("public_key"),
+                port = serverJson.getInt("port"),
+            ),
+        )
     }
 
     private fun parseRegistration(body: String): RegistrationResult {

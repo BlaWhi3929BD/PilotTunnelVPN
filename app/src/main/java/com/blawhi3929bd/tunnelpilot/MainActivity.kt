@@ -124,6 +124,7 @@ private fun TunnelPilotScreen(
                 provisioningState = provisioningState,
                 onControlPlaneUrl = viewModel::setControlPlaneUrl,
                 onProvision = viewModel::provision,
+                onRotateKey = viewModel::rotateDeviceKey,
             )
         }
     }
@@ -247,6 +248,7 @@ private fun SetupSection(
     provisioningState: ProvisioningState,
     onControlPlaneUrl: (String) -> Unit,
     onProvision: () -> Unit,
+    onRotateKey: () -> Unit,
 ) {
     Column {
         Text("Automatic server setup", style = MaterialTheme.typography.titleLarge)
@@ -270,6 +272,14 @@ private fun SetupSection(
             onClick = onProvision,
         ) {
             Text("Provision device")
+        }
+        Spacer(Modifier.height(8.dp))
+        OutlinedButton(
+            modifier = Modifier.fillMaxWidth(),
+            onClick = onRotateKey,
+            enabled = provisioningState is ProvisioningState.Provisioned,
+        ) {
+            Text("Rotate client key")
         }
         Spacer(Modifier.height(12.dp))
         when (provisioningState) {
