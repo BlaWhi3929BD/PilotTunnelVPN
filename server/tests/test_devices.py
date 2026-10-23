@@ -794,6 +794,17 @@ def test_reconcile_server_blocks_pruning_against_empty_db_without_confirmation(m
         def __exit__(self, *args):
             return False
 
+        def get(self, path):
+            return FakeGatewayResponse(
+                payload={
+                    "status": "ok",
+                    "wireguard_available": True,
+                    "peer_count": len(gateway_peers),
+                    "peer_capacity": 240,
+                    "capacity_remaining": 240 - len(gateway_peers),
+                }
+            )
+
         def request(self, method, path, *, headers, json=None):
             if method == "DELETE":
                 gateway_peers.clear()
@@ -861,6 +872,17 @@ def test_reconcile_server_aborts_on_foreign_interface_or_corrupt_db(monkeypatch,
 
         def __exit__(self, *args):
             return False
+
+        def get(self, path):
+            return FakeGatewayResponse(
+                payload={
+                    "status": "ok",
+                    "wireguard_available": True,
+                    "peer_count": len(gateway_peers),
+                    "peer_capacity": 240,
+                    "capacity_remaining": 240 - len(gateway_peers),
+                }
+            )
 
         def request(self, method, path, *, headers, json=None):
             return ForeignIfaceResponse()
@@ -1047,6 +1069,134 @@ def test_reconcile_end_to_end_with_gateway_agent_app(monkeypatch) -> None:
     assert report["unknown_peers"] == 1
     assert mutation_calls == []
     assert VALID_PUBLIC_KEY not in gw_peers
+
+
+def test_open_registration_never_bypasses_admin_auth_on_reconcile_or_revocation(monkeypatch) -> None:
+    main.ALLOW_OPEN_REGISTRATION = True
+    main.CONTROL_PLANE_TOKEN = "secret-admin-token"
+    main.GATEWAY_AGENT_URL = "http://gateway-agent.test"
+    main.GATEWAY_AGENT_TOKEN = "gateway-token"
+    main.SERVERS[0].gateway_api_url = "http://gateway-agent.test"
+
+    gateway_peers: dict[str, list[str]] = {}
+    gateway_calls: list[tuple[str, str]] = []
+
+    class FakeGatewayResponse:
+        def __init__(self, status_code: int = 200, payload: dict | None = None):
+            self.status_code = status_code
+            self._payload = payload or {
+                "interface": "tunnelpilot0",
+                "peers": sorted(gateway_peers.keys()),
+                "peer_allowed_ips": dict(gateway_peers),
+            }
+            self.text = "ok"
+
+        def json(self):
+            return self._payload
+
+    class FakeGatewayClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, path):
+            return FakeGatewayResponse(
+                payload={
+                    "status": "ok",
+                    "wireguard_available": True,
+                    "peer_count": len(gateway_peers),
+                    "peer_capacity": 240,
+                    "capacity_remaining": 240 - len(gateway_peers),
+                }
+            )
+
+        def request(self, method, path, *, headers, json=None):
+            gateway_calls.append((method, path))
+            if method == "POST" and path == "/v1/peers" and json:
+                gateway_peers[json["public_key"]] = [json["allowed_ip"]]
+            elif method == "DELETE" and path.startswith("/v1/peers?public_key="):
+                from urllib.parse import unquote
+
+                encoded = path.split("public_key=", 1)[1]
+                gateway_peers.pop(unquote(encoded), None)
+            return FakeGatewayResponse()
+
+    monkeypatch.setattr(main.httpx, "Client", FakeGatewayClient)
+    server_id = main.SERVERS[0].id
+
+    # 1. Public client registration works without Bearer token when ALLOW_OPEN_REGISTRATION=true
+    created = client.post(
+        "/v1/devices",
+        json=registration(device_id="device-open", public_key=VALID_PUBLIC_KEY),
+    )
+    assert created.status_code == 200
+    device_token = created.json()["device_token"]
+    assert device_token is not None
+    assert VALID_PUBLIC_KEY in gateway_peers
+
+    # Existing device still requires X-Device-Token
+    re_reg_unauth = client.post(
+        "/v1/devices",
+        json=registration(device_id="device-open", public_key=VALID_PUBLIC_KEY),
+    )
+    assert re_reg_unauth.status_code == 401
+    re_reg_auth = client.post(
+        "/v1/devices",
+        json=registration(device_id="device-open", public_key=VALID_PUBLIC_KEY),
+        headers={"X-Device-Token": device_token},
+    )
+    assert re_reg_auth.status_code == 200
+
+    # 2. Rejected admin calls without Bearer token or with wrong token get 401 and do NOT touch gateway or DB
+    gateway_calls.clear()
+    wrong_headers = {"Authorization": "Bearer wrong-admin-token"}
+
+    assert client.post("/v1/servers/reconcile").status_code == 401
+    assert client.post(f"/v1/servers/{server_id}/reconcile").status_code == 401
+    assert client.delete("/v1/devices/device-open").status_code == 401
+    assert client.delete("/v1/devices/device-open?force=true").status_code == 401
+
+    assert client.post("/v1/servers/reconcile", headers=wrong_headers).status_code == 401
+    assert client.post(f"/v1/servers/{server_id}/reconcile", headers=wrong_headers).status_code == 401
+    assert client.delete("/v1/devices/device-open", headers=wrong_headers).status_code == 401
+    assert client.delete("/v1/devices/device-open?force=true", headers=wrong_headers).status_code == 401
+
+    assert gateway_calls == []
+    assert VALID_PUBLIC_KEY in gateway_peers
+    assert main.DEVICE_STORE.get("device-open") is not None
+
+    # 3. Missing admin token in configuration fails closed with 503 even when ALLOW_OPEN_REGISTRATION=true
+    main.CONTROL_PLANE_TOKEN = None
+    assert client.post("/v1/servers/reconcile").status_code == 503
+    assert client.post(f"/v1/servers/{server_id}/reconcile").status_code == 503
+    assert client.delete("/v1/devices/device-open?force=true").status_code == 503
+    assert client.delete("/v1/devices/device-open", headers=wrong_headers).status_code == 503
+    assert gateway_calls == []
+    assert VALID_PUBLIC_KEY in gateway_peers
+    assert main.DEVICE_STORE.get("device-open") is not None
+
+    # 4. With valid admin Bearer token, reconcile and admin revocation succeed
+    main.CONTROL_PLANE_TOKEN = "secret-admin-token"
+    admin_headers = {"Authorization": "Bearer secret-admin-token"}
+
+    rec_all = client.post("/v1/servers/reconcile", json={"dry_run": True}, headers=admin_headers)
+    assert rec_all.status_code == 200
+    assert rec_all.json()[0]["status"] == "dry_run"
+
+    rec_one = client.post(f"/v1/servers/{server_id}/reconcile", json={"dry_run": True}, headers=admin_headers)
+    assert rec_one.status_code == 200
+    assert rec_one.json()["status"] == "dry_run"
+
+    revoked = client.delete("/v1/devices/device-open", headers=admin_headers)
+    assert revoked.status_code == 200
+    assert VALID_PUBLIC_KEY not in gateway_peers
+    assert main.DEVICE_STORE.get("device-open") is None
+
 
 
 

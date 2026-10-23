@@ -223,15 +223,24 @@ def _load_record(device_id: str) -> DeviceRecord | None:
     return record
 
 
+def _has_configured_admin_token() -> bool:
+    return bool(CONTROL_PLANE_TOKEN and CONTROL_PLANE_TOKEN.strip())
+
+
 def _is_valid_admin_token(authorization: str | None) -> bool:
-    if not CONTROL_PLANE_TOKEN or not CONTROL_PLANE_TOKEN.strip() or not authorization:
+    if not _has_configured_admin_token() or not authorization:
         return False
     expected = f"Bearer {CONTROL_PLANE_TOKEN}"
     return hmac.compare_digest(authorization, expected)
 
 
 def _require_admin_auth(authorization: str | None) -> None:
-    if not CONTROL_PLANE_TOKEN or not CONTROL_PLANE_TOKEN.strip():
+    """Strictly enforces administrative Bearer token authentication.
+
+    Never affected by TUNNELPILOT_ALLOW_OPEN_REGISTRATION. Fails closed with 503
+    if TUNNELPILOT_CONTROL_PLANE_TOKEN is not configured, and 401 if missing/invalid.
+    """
+    if not _has_configured_admin_token():
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Control plane admin token is not configured",
@@ -240,10 +249,16 @@ def _require_admin_auth(authorization: str | None) -> None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
 
 
-def _require_control_plane_auth(authorization: str | None) -> None:
+def _require_registration_auth(authorization: str | None) -> None:
+    """Enforces client device enrollment policy on POST /v1/devices only.
+
+    Never used for administrative endpoints (reconcile, admin revocation, force delete).
+    """
     if ALLOW_OPEN_REGISTRATION:
+        if authorization is not None and not _is_valid_admin_token(authorization):
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
         return
-    if CONTROL_PLANE_TOKEN is not None and CONTROL_PLANE_TOKEN.strip():
+    if _has_configured_admin_token():
         if not _is_valid_admin_token(authorization):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Unauthorized")
         return
@@ -762,7 +777,7 @@ def register_device(
     authorization: Annotated[str | None, Header()] = None,
     x_device_token: Annotated[str | None, Header()] = None,
 ) -> DeviceRegistrationResponse:
-    _require_control_plane_auth(authorization)
+    _require_registration_auth(authorization)
 
     existing = _load_record(registration.device_id)
     issued_token: str | None = None
@@ -943,7 +958,8 @@ def _require_revocation_auth(
     *,
     force: bool = False,
 ) -> bool:
-    if _is_valid_admin_token(authorization):
+    if authorization is not None:
+        _require_admin_auth(authorization)
         return True
 
     if (
@@ -958,6 +974,12 @@ def _require_revocation_auth(
             )
         return False
 
+    if force and not _has_configured_admin_token():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Control plane admin token is not configured",
+        )
+
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Unauthorized: requires admin Bearer token or valid X-Device-Token",
@@ -971,6 +993,19 @@ def revoke_device(
     x_device_token: Annotated[str | None, Header()] = None,
     force: bool = False,
 ) -> DeviceRevocationResponse:
+    if authorization is None and x_device_token is None:
+        if force and not _has_configured_admin_token():
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Control plane admin token is not configured",
+            )
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized: requires admin Bearer token or valid X-Device-Token",
+        )
+    if authorization is not None:
+        _require_admin_auth(authorization)
+
     record = _load_record(device_id)
     if record is None:
         raise HTTPException(status_code=404, detail="Device not found")
