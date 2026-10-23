@@ -3,6 +3,8 @@ set -euo pipefail
 
 export ADB_LIBUSB=0
 URI="content://com.blawhi3929bd.tunnelpilot.debug.cli"
+PKG="com.blawhi3929bd.tunnelpilot.debug"
+ACTIVITY="$PKG/com.blawhi3929bd.tunnelpilot.MainActivity"
 
 ensure_adb() {
   if ! adb get-state >/dev/null 2>&1; then
@@ -10,19 +12,52 @@ ensure_adb() {
     ADB_LIBUSB=0 adb start-server >/dev/null 2>&1
     sleep 1
   fi
+  if ! adb get-state >/dev/null 2>&1; then
+    echo "Error: no Android device reachable via ADB (ADB_LIBUSB=0)" >&2
+    exit 2
+  fi
+}
+
+ensure_app_started() {
+  if [[ -z "$(adb shell pidof "$PKG" 2>/dev/null || true)" ]]; then
+    if ! adb shell pm path "$PKG" >/dev/null 2>&1; then
+      echo "Error: package $PKG is not installed on the device" >&2
+      exit 2
+    fi
+    adb shell am start -W -n "$ACTIVITY" >/dev/null 2>&1 || true
+  fi
 }
 
 call_cli() {
   local method="$1"
   local arg="${2:-}"
   ensure_adb
-  if [[ -z "$(adb shell pidof com.blawhi3929bd.tunnelpilot.debug 2>/dev/null || true)" ]]; then
-    adb shell am start -W -n com.blawhi3929bd.tunnelpilot.debug/com.blawhi3929bd.tunnelpilot.MainActivity >/dev/null 2>&1 || true
-  fi
+  ensure_app_started
+
+  local output
   if [[ -n "$arg" ]]; then
-    adb shell content call --uri "$URI" --method "$method" --arg "$arg"
+    if ! output="$(adb shell content call --uri "$URI" --method "$method" --arg "$arg" 2>&1)"; then
+      echo "$output" >&2
+      exit 2
+    fi
   else
-    adb shell content call --uri "$URI" --method "$method"
+    if ! output="$(adb shell content call --uri "$URI" --method "$method" 2>&1)"; then
+      echo "$output" >&2
+      exit 2
+    fi
+  fi
+
+  echo "$output"
+
+  if [[ "$output" == *"Could not find provider"* ]] || [[ "$output" == *"SecurityException"* ]]; then
+    exit 2
+  fi
+
+  if [[ "$output" == *"ok=false"* ]]; then
+    if [[ "$output" == *"Control plane"* ]] || [[ "$output" == *"Failed to connect"* ]] || [[ "$output" == *"Cleartext"* ]] || [[ "$output" == *"timed out"* ]]; then
+      exit 3
+    fi
+    exit 1
   fi
 }
 
@@ -37,6 +72,9 @@ case "$cmd" in
     ;;
   status)
     call_cli "status"
+    ;;
+  servers|check-servers|check_servers)
+    call_cli "check_servers"
     ;;
   set-url|set_url)
     call_cli "set_url" "${1:?Usage: $0 set-url <url>}"
@@ -63,17 +101,20 @@ case "$cmd" in
     call_cli "apply_routing"
     ;;
   revoke|clear-config|clear_config)
-    call_cli "revoke"
+    call_cli "revoke" "${1:-}"
     ;;
   reset-identity|reset_identity)
-    call_cli "reset_identity"
-    ;;
-  servers|check-servers|check_servers)
-    call_cli "check_servers"
+    call_cli "reset_identity" "${1:-}"
     ;;
   help|-h|--help)
     cat <<EOF
 Usage: $0 <command> [arg]
+
+Exit codes:
+  0  Success (ok=true)
+  1  Application/validation error (ok=false)
+  2  ADB / device / provider error
+  3  Network / Control Plane communication error
 
 Commands:
   install [apk_path]             Install debug APK (auto-fixing ADB_LIBUSB=0) and set adb reverse tcp:8000
@@ -88,8 +129,8 @@ Commands:
                                  Switch routing mode
   set-apps <pkg1,pkg2,...>       Set comma-separated package list for SELECTED_APPS mode
   apply-routing                  Reconnect tunnel if active to apply routing changes
-  revoke                         Revoke device on server and clear local config/keys
-  reset-identity                 Revoke old identity, generate a new device_id, and clear keys
+  revoke [force_local]           Revoke device on server and clear local config/keys
+  reset-identity [force_local]   Revoke old identity, generate a new device_id, and clear keys
 EOF
     ;;
   *)

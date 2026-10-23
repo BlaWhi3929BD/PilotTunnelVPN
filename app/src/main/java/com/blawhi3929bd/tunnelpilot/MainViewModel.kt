@@ -20,6 +20,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val controlPlaneUrl: StateFlow<String> = controller.controlPlaneUrl
     val provisioningState: StateFlow<ProvisioningState> = controller.provisioningState
     val servers: StateFlow<List<RegisteredServer>> = controller.servers
+    val serversLoaded: StateFlow<Boolean> = controller.serversLoaded
     val serversError: StateFlow<String?> = controller.serversError
 
     fun requiredVpnPermissionIntent(): Intent? = controller.requiredVpnPermissionIntent()

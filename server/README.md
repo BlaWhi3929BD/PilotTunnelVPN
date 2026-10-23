@@ -11,21 +11,25 @@ The control plane never receives a client private key and never needs the gatewa
 
 - `GET /healthz` — liveness.
 - `GET /v1/servers` — enabled WireGuard gateways with live health/capacity data.
-- `POST /v1/servers/reconcile` & `POST /v1/servers/{server_id}/reconcile` — reconciles SQLite-provisioned device peers with the live WireGuard interface on the gateway (restoring missing peers and removing orphaned peers). Also runs best-effort on Control Plane startup.
+- `POST /v1/servers/reconcile` & `POST /v1/servers/{server_id}/reconcile` — fail-closed administrative endpoints (`Authorization: Bearer <TUNNELPILOT_CONTROL_PLANE_TOKEN>`). By default (`prune_unknown=false`), reconciliation is strictly non-destructive: it verifies SQLite integrity and interface ownership (`tunnelpilot*`), restores missing/mismatched provisioned peers, and reports unknown peers without deleting them. Supports `?dry_run=true` to preview diffs without modifying the gateway, `?prune_unknown=true` to remove unknown peers within the managed `/32` address pool (while never deleting peers with routes outside `TUNNELPILOT_VPN_ADDRESS_POOL`), and requires `?confirm_empty_db=true` before pruning against an empty server inventory. Startup reconciliation is always non-destructive (`prune_unknown=false`).
 - `POST /v1/devices` — first registration allocates a `/32`, issues a device token, and provisions the gateway peer. Existing devices must authenticate with `X-Device-Token`; registration is idempotent and repairs a missing gateway peer.
-- `POST /v1/devices/{device_id}/rotate` — authenticated WireGuard public-key rotation while preserving the device ID, VPN address, server assignment, and device token.
-- `DELETE /v1/devices/{device_id}` — fail-closed revocation requiring either the admin `Authorization: Bearer <token>` or the device's `X-Device-Token`; removes the gateway peer first and retains the SQLite record on gateway failure unless `?force=true` is specified.
+- `POST /v1/devices/{device_id}/rotate` — authenticated WireGuard public-key rotation while preserving the device ID, VPN address, server assignment, and device token. Provisions the new peer before removing the old peer so gateway errors never leave the device without an active peer.
+- `DELETE /v1/devices/{device_id}` — fail-closed revocation requiring either the admin `Authorization: Bearer <token>` or the device's `X-Device-Token`; removes the gateway peer first and retains the SQLite record on gateway failure. The `?force=true` override requires the administrative `Bearer` token.
 
 ### Environment
 
 ```text
-TUNNELPILOT_CONTROL_PLANE_TOKEN=optional-admin-Bearer-token
+TUNNELPILOT_ENV=development
+TUNNELPILOT_CONTROL_PLANE_TOKEN=required-for-admin-and-production
+TUNNELPILOT_ALLOW_OPEN_REGISTRATION=false
 TUNNELPILOT_GATEWAY_AGENT_URL=http://127.0.0.1:8787
 TUNNELPILOT_GATEWAY_AGENT_TOKEN=long-random-secret
 TUNNELPILOT_DATABASE_PATH=server/data/tunnelpilot.db
 TUNNELPILOT_VPN_ADDRESS_POOL=10.67.0.0/24
 TUNNELPILOT_VPN_GATEWAY_ADDRESS=10.67.0.1
 ```
+
+When `TUNNELPILOT_ENV=production`, startup validation refuses to start if `TUNNELPILOT_CONTROL_PLANE_TOKEN`, `TUNNELPILOT_GATEWAY_AGENT_URL`, `TUNNELPILOT_GATEWAY_AGENT_TOKEN`, or valid non-placeholder server hostnames/public keys are missing.
 
 The gateway agent URL can also be set per server with the `gateway_api_url` field in the server catalog.
 
@@ -60,7 +64,7 @@ Do not expose the gateway agent directly to the public internet. Keep it on loca
 ## Development helper scripts
 
 For local development and testing:
-- `./scripts/start-gateway-agent.sh`: generates a temporary gateway token and starts the Gateway Agent on `127.0.0.1:8787`.
+- `./scripts/start-gateway-agent.sh`: generates a temporary gateway token (stored in `server/data/gateway-agent.token` with `0600` permissions) and starts the Gateway Agent on `127.0.0.1:8787` as an unprivileged user with ambient `CAP_NET_ADMIN` only (`setpriv`).
 - `./scripts/start-control-plane.sh`: reads the gateway token and server public key, detects the gateway endpoint IP, and starts the Control Plane on `0.0.0.0:8000`.
 - `./scripts/fix-gateway-forwarding.sh`: configures `sysctl` IP forwarding, NAT `MASQUERADE`, and TCP MSS clamping (`--clamp-mss-to-pmtu`) to prevent packet drops on HTTPS traffic.
 - `./scripts/tp-adb-cli.sh`: remote CLI wrapper over ADB (`status`, `servers`, `provision`, `rotate-key`, `connect`, `disconnect`, `set-mode`, `set-apps`, `apply-routing`, `revoke`, `reset-identity`) for automated testing of debug builds on a connected Android device.

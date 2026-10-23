@@ -1,9 +1,12 @@
 package com.blawhi3929bd.tunnelpilot.provisioning
 
 import com.sun.net.httpserver.HttpServer
+import com.blawhi3929bd.tunnelpilot.debug.DebugCliProvider
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import java.net.InetSocketAddress
@@ -202,5 +205,78 @@ class ControlPlaneClientTest {
         assertEquals(2, servers[0].peerCount)
         assertEquals(240, servers[0].peerCapacity)
         assertEquals(238, servers[0].capacityRemaining)
+    }
+
+    @Test
+    fun listServers_emptyCatalogReturnsEmptyList() {
+        server.createContext("/v1/servers") { exchange ->
+            val bytes = "[]".toByteArray(Charsets.UTF_8)
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.write(bytes)
+            exchange.close()
+        }
+
+        val client = ControlPlaneClient("http://127.0.0.1:$serverPort")
+        assertTrue(client.listServers().isEmpty())
+    }
+
+    @Test(expected = IllegalStateException::class)
+    fun listServers_malformedJsonThrows() {
+        server.createContext("/v1/servers") { exchange ->
+            val bytes = "{not-an-array}".toByteArray(Charsets.UTF_8)
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.write(bytes)
+            exchange.close()
+        }
+
+        val client = ControlPlaneClient("http://127.0.0.1:$serverPort")
+        client.listServers()
+    }
+
+    @Test
+    fun registerDevice_conflictCarriesHttp409StatusCode() {
+        server.createContext("/v1/devices") { exchange ->
+            val bytes = """{"detail": "device_id is already registered with a different public key"}"""
+                .toByteArray(Charsets.UTF_8)
+            exchange.sendResponseHeaders(409, bytes.size.toLong())
+            exchange.responseBody.write(bytes)
+            exchange.close()
+        }
+
+        val client = ControlPlaneClient("http://127.0.0.1:$serverPort")
+        try {
+            client.registerDevice("dev-1", "pubkey", "0.2.0", "token")
+            fail("Expected ControlPlaneHttpException")
+        } catch (e: ControlPlaneHttpException) {
+            assertEquals(409, e.statusCode)
+            assertTrue(e.message!!.contains("different public key"))
+        }
+    }
+
+    @Test
+    fun debugCliProvider_isAllowedCallerUidEnforcesShellRootAndDebugBuild() {
+        assertTrue(DebugCliProvider.isAllowedCallerUid(uid = 2000, appUid = 10234, isDebugBuild = true))
+        assertTrue(DebugCliProvider.isAllowedCallerUid(uid = 0, appUid = 10234, isDebugBuild = true))
+        assertTrue(DebugCliProvider.isAllowedCallerUid(uid = 10234, appUid = 10234, isDebugBuild = true))
+        assertFalse(DebugCliProvider.isAllowedCallerUid(uid = 10999, appUid = 10234, isDebugBuild = true))
+        assertFalse(DebugCliProvider.isAllowedCallerUid(uid = 2000, appUid = 10234, isDebugBuild = false))
+    }
+
+    @Test
+    fun releaseManifest_excludesDebugCliProviderAndCleartextTraffic() {
+        val mainManifest = java.io.File("src/main/AndroidManifest.xml")
+        if (mainManifest.exists()) {
+            val content = mainManifest.readText()
+            assertFalse(content.contains("DebugCliProvider"))
+            assertFalse(content.contains("usesCleartextTraffic"))
+        }
+        val mergedReleaseManifest = java.io.File(
+            "build/intermediates/merged_manifest/release/processReleaseMainManifest/AndroidManifest.xml",
+        )
+        if (mergedReleaseManifest.exists()) {
+            val releaseContent = mergedReleaseManifest.readText()
+            assertFalse(releaseContent.contains("DebugCliProvider"))
+            assertFalse(releaseContent.contains("usesCleartextTraffic"))
+        }
     }
 }

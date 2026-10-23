@@ -74,10 +74,16 @@ class DebugCliProvider : ContentProvider() {
                     controller.applyRoutingChangesNow().map { "routing applied" }
                 }
                 "revoke", "clear_config" -> {
-                    controller.clearConfigNow().map { "revoked and cleared config" }
+                    val forceLocal = arg?.trim()?.equals("force_local", ignoreCase = true) == true
+                    controller.clearConfigNow(forceLocal = forceLocal).map {
+                        if (forceLocal) "cleared local config (force_local)" else "revoked and cleared config"
+                    }
                 }
                 "reset_identity" -> {
-                    controller.resetIdentityNow().map { newId -> "reset_identity new_device_id=$newId" }
+                    val forceLocal = arg?.trim()?.equals("force_local", ignoreCase = true) == true
+                    controller.resetIdentityNow(forceLocal = forceLocal).map { newId ->
+                        "reset_identity new_device_id=$newId"
+                    }
                 }
                 "check_servers", "servers" -> {
                     controller.refreshServersNow().map { list ->
@@ -117,8 +123,18 @@ class DebugCliProvider : ContentProvider() {
     private fun enforceShellCaller() {
         check(BuildConfig.DEBUG) { "DebugCliProvider is only available in debug builds" }
         val uid = Binder.getCallingUid()
-        if (uid != Process.SHELL_UID && uid != Process.ROOT_UID && uid != Process.myUid()) {
+        if (!isAllowedCallerUid(uid = uid, appUid = Process.myUid(), isDebugBuild = BuildConfig.DEBUG)) {
             throw SecurityException("DebugCliProvider is restricted to ADB shell (caller uid=$uid)")
+        }
+    }
+
+    companion object {
+        private const val ROOT_UID = 0
+        private const val SHELL_UID = 2000
+
+        internal fun isAllowedCallerUid(uid: Int, appUid: Int, isDebugBuild: Boolean): Boolean {
+            if (!isDebugBuild) return false
+            return uid == SHELL_UID || uid == ROOT_UID || uid == appUid
         }
     }
 

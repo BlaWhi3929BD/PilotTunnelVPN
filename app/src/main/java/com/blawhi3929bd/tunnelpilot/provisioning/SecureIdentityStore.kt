@@ -32,6 +32,21 @@ class SecureIdentityStore(context: Context) {
         prefs.edit {
             remove(KEY_PRIVATE_KEY_CIPHERTEXT)
             remove(KEY_PRIVATE_KEY_IV)
+            remove(KEY_PENDING_PRIVATE_KEY_CIPHERTEXT)
+            remove(KEY_PENDING_PRIVATE_KEY_IV)
+        }
+    }
+
+    fun loadPendingPrivateKey(): String? =
+        loadEncrypted(KEY_PENDING_PRIVATE_KEY_CIPHERTEXT, KEY_PENDING_PRIVATE_KEY_IV)
+
+    fun savePendingPrivateKey(privateKey: String) =
+        saveEncrypted(KEY_PENDING_PRIVATE_KEY_CIPHERTEXT, KEY_PENDING_PRIVATE_KEY_IV, privateKey)
+
+    fun clearPendingPrivateKey() {
+        prefs.edit {
+            remove(KEY_PENDING_PRIVATE_KEY_CIPHERTEXT)
+            remove(KEY_PENDING_PRIVATE_KEY_IV)
         }
     }
 
@@ -52,6 +67,8 @@ class SecureIdentityStore(context: Context) {
             putString(KEY_DEVICE_ID, newDeviceId)
             remove(KEY_PRIVATE_KEY_CIPHERTEXT)
             remove(KEY_PRIVATE_KEY_IV)
+            remove(KEY_PENDING_PRIVATE_KEY_CIPHERTEXT)
+            remove(KEY_PENDING_PRIVATE_KEY_IV)
             remove(KEY_DEVICE_TOKEN_CIPHERTEXT)
             remove(KEY_DEVICE_TOKEN_IV)
         }
@@ -116,6 +133,8 @@ class SecureIdentityStore(context: Context) {
         const val KEY_DEVICE_ID = "device_id"
         const val KEY_PRIVATE_KEY_CIPHERTEXT = "private_key_ciphertext"
         const val KEY_PRIVATE_KEY_IV = "private_key_iv"
+        const val KEY_PENDING_PRIVATE_KEY_CIPHERTEXT = "pending_private_key_ciphertext"
+        const val KEY_PENDING_PRIVATE_KEY_IV = "pending_private_key_iv"
         const val KEY_DEVICE_TOKEN_CIPHERTEXT = "device_token_ciphertext"
         const val KEY_DEVICE_TOKEN_IV = "device_token_iv"
     }

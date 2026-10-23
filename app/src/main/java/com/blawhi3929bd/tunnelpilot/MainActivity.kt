@@ -84,6 +84,7 @@ private fun TunnelPilotScreen(
     val controlPlaneUrl by viewModel.controlPlaneUrl.collectAsState()
     val provisioningState by viewModel.provisioningState.collectAsState()
     val servers by viewModel.servers.collectAsState()
+    val serversLoaded by viewModel.serversLoaded.collectAsState()
     val serversError by viewModel.serversError.collectAsState()
 
     Column(Modifier.fillMaxSize().padding(20.dp)) {
@@ -126,6 +127,7 @@ private fun TunnelPilotScreen(
                 controlPlaneUrl = controlPlaneUrl,
                 provisioningState = provisioningState,
                 servers = servers,
+                serversLoaded = serversLoaded,
                 serversError = serversError,
                 onControlPlaneUrl = viewModel::setControlPlaneUrl,
                 onProvision = viewModel::provision,
@@ -254,6 +256,7 @@ private fun SetupSection(
     controlPlaneUrl: String,
     provisioningState: ProvisioningState,
     servers: List<RegisteredServer>,
+    serversLoaded: Boolean,
     serversError: String?,
     onControlPlaneUrl: (String) -> Unit,
     onProvision: () -> Unit,
@@ -325,7 +328,8 @@ private fun SetupSection(
         if (serversError != null) {
             Spacer(Modifier.height(8.dp))
             Text(serversError, color = MaterialTheme.colorScheme.error)
-        } else if (servers.isNotEmpty()) {
+        }
+        if (servers.isNotEmpty()) {
             Spacer(Modifier.height(12.dp))
             Text("Gateway catalog", style = MaterialTheme.typography.titleMedium)
             servers.forEach { server ->
@@ -339,6 +343,9 @@ private fun SetupSection(
                     style = MaterialTheme.typography.bodySmall,
                 )
             }
+        } else if (serversLoaded) {
+            Spacer(Modifier.height(8.dp))
+            Text("No enabled VPN servers reported by control plane.")
         }
     }
 }

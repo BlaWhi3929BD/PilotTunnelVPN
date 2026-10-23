@@ -8,6 +8,11 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 
+class ControlPlaneHttpException(
+    val statusCode: Int,
+    message: String,
+) : IllegalStateException(message)
+
 class ControlPlaneClient(
     private val baseUrl: String,
     private val connectTimeoutMs: Int = 8_000,
@@ -50,7 +55,7 @@ class ControlPlaneClient(
             val responseCode = connection.responseCode
             val responseBody = readResponseBody(connection, responseCode)
             if (responseCode !in 200..299) {
-                throw IllegalStateException(parseError(responseBody, responseCode))
+                throw ControlPlaneHttpException(responseCode, parseError(responseBody, responseCode))
             }
 
             parseRegistration(responseBody)
@@ -95,7 +100,7 @@ class ControlPlaneClient(
             val responseCode = connection.responseCode
             val responseBody = readResponseBody(connection, responseCode)
             if (responseCode !in 200..299) {
-                throw IllegalStateException(parseError(responseBody, responseCode))
+                throw ControlPlaneHttpException(responseCode, parseError(responseBody, responseCode))
             }
 
             parseRotation(responseBody)
@@ -124,7 +129,7 @@ class ControlPlaneClient(
             val responseCode = connection.responseCode
             if (responseCode !in 200..299 && responseCode != 404) {
                 val responseBody = readResponseBody(connection, responseCode)
-                throw IllegalStateException(parseError(responseBody, responseCode))
+                throw ControlPlaneHttpException(responseCode, parseError(responseBody, responseCode))
             }
             true
         } finally {
@@ -145,9 +150,11 @@ class ControlPlaneClient(
             val responseCode = connection.responseCode
             val responseBody = readResponseBody(connection, responseCode)
             if (responseCode !in 200..299) {
-                throw IllegalStateException(parseError(responseBody, responseCode))
+                throw ControlPlaneHttpException(responseCode, parseError(responseBody, responseCode))
             }
-            val array = JSONArray(responseBody)
+            val array = runCatching { JSONArray(responseBody) }.getOrElse {
+                throw IllegalStateException("Invalid server catalog response from control plane", it)
+            }
             buildList(array.length()) {
                 for (i in 0 until array.length()) {
                     add(parseServer(array.getJSONObject(i)))
@@ -180,17 +187,48 @@ class ControlPlaneClient(
     }
 
 
-    private fun parseServer(serverJson: JSONObject): RegisteredServer = RegisteredServer(
-        id = serverJson.getString("id"),
-        region = serverJson.getString("region"),
-        hostname = serverJson.getString("hostname"),
-        publicKey = serverJson.getString("public_key"),
-        port = serverJson.getInt("port"),
-        healthStatus = serverJson.optString("health_status", "unknown").ifBlank { "unknown" },
-        peerCount = if (serverJson.has("peer_count") && !serverJson.isNull("peer_count")) serverJson.getInt("peer_count") else null,
-        peerCapacity = if (serverJson.has("peer_capacity") && !serverJson.isNull("peer_capacity")) serverJson.getInt("peer_capacity") else null,
-        capacityRemaining = if (serverJson.has("capacity_remaining") && !serverJson.isNull("capacity_remaining")) serverJson.getInt("capacity_remaining") else null,
-    )
+    private fun parseServer(serverJson: JSONObject): RegisteredServer {
+        val id = serverJson.optString("id").trim()
+        val region = serverJson.optString("region").trim()
+        val hostname = serverJson.optString("hostname").trim()
+        val publicKey = serverJson.optString("public_key").trim()
+        val port = serverJson.optInt("port", -1)
+        require(id.isNotEmpty()) { "Server id is missing in response" }
+        require(region.isNotEmpty()) { "Server region is missing in response" }
+        require(hostname.isNotEmpty()) { "Server hostname is missing in response" }
+        require(publicKey.isNotEmpty()) { "Server public_key is missing in response" }
+        require(port in 1..65535) { "Server port is invalid: $port" }
+
+        val peerCount = if (serverJson.has("peer_count") && !serverJson.isNull("peer_count")) {
+            serverJson.getInt("peer_count").coerceAtLeast(0)
+        } else {
+            null
+        }
+        val peerCapacity = if (serverJson.has("peer_capacity") && !serverJson.isNull("peer_capacity")) {
+            serverJson.getInt("peer_capacity").coerceAtLeast(0)
+        } else {
+            null
+        }
+        val capacityRemaining = if (serverJson.has("capacity_remaining") && !serverJson.isNull("capacity_remaining")) {
+            serverJson.getInt("capacity_remaining").coerceAtLeast(0)
+        } else if (peerCapacity != null && peerCount != null) {
+            (peerCapacity - peerCount).coerceAtLeast(0)
+        } else {
+            null
+        }
+
+        return RegisteredServer(
+            id = id,
+            region = region,
+            hostname = hostname,
+            publicKey = publicKey,
+            port = port,
+            healthStatus = serverJson.optString("health_status", "unknown").trim().ifBlank { "unknown" },
+            peerCount = peerCount,
+            peerCapacity = peerCapacity,
+            capacityRemaining = capacityRemaining,
+        )
+    }
 
     private fun parseRotation(body: String): RotationResult {
         val json = JSONObject(body)
