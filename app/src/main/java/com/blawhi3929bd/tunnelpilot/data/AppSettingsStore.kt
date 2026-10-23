@@ -4,28 +4,37 @@ import android.content.Context
 import androidx.core.content.edit
 import com.blawhi3929bd.tunnelpilot.RoutingMode
 
-class AppSettingsStore(context: Context) {
+interface SettingsStorage {
+    fun getRoutingMode(): RoutingMode
+    fun setRoutingMode(mode: RoutingMode)
+    fun getSelectedApps(): Set<String>
+    fun setSelectedApps(packages: Set<String>)
+    fun getControlPlaneUrl(): String
+    fun setControlPlaneUrl(url: String)
+}
+
+class AppSettingsStore(context: Context) : SettingsStorage {
     private val prefs = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
-    fun getRoutingMode(): RoutingMode = when (prefs.getString(KEY_ROUTING_MODE, null)) {
+    override fun getRoutingMode(): RoutingMode = when (prefs.getString(KEY_ROUTING_MODE, null)) {
         RoutingMode.SELECTED_APPS.name -> RoutingMode.SELECTED_APPS
         else -> RoutingMode.ALL_APPS
     }
 
-    fun setRoutingMode(mode: RoutingMode) {
+    override fun setRoutingMode(mode: RoutingMode) {
         prefs.edit { putString(KEY_ROUTING_MODE, mode.name) }
     }
 
-    fun getSelectedApps(): Set<String> = prefs.getStringSet(KEY_SELECTED_APPS, emptySet()).orEmpty()
+    override fun getSelectedApps(): Set<String> = prefs.getStringSet(KEY_SELECTED_APPS, emptySet()).orEmpty()
 
-    fun setSelectedApps(packages: Set<String>) {
+    override fun setSelectedApps(packages: Set<String>) {
         prefs.edit { putStringSet(KEY_SELECTED_APPS, packages.toSet()) }
     }
 
-    fun getControlPlaneUrl(): String =
+    override fun getControlPlaneUrl(): String =
         prefs.getString(KEY_CONTROL_PLANE_URL, DEFAULT_CONTROL_PLANE_URL).orEmpty()
 
-    fun setControlPlaneUrl(url: String) {
+    override fun setControlPlaneUrl(url: String) {
         prefs.edit { putString(KEY_CONTROL_PLANE_URL, url.trim()) }
     }
 

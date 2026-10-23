@@ -76,6 +76,9 @@ case "$cmd" in
   servers|check-servers|check_servers)
     call_cli "check_servers"
     ;;
+  probe-http|probe_http)
+    call_cli "probe_http" "${1:?Usage: $0 probe-http <url>}"
+    ;;
   set-url|set_url)
     call_cli "set_url" "${1:?Usage: $0 set-url <url>}"
     ;;

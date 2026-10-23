@@ -13,22 +13,36 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
+interface IdentityStorage {
+    fun getOrCreateDeviceId(): String
+    fun loadPrivateKey(): String?
+    fun savePrivateKey(privateKey: String)
+    fun clearPrivateKey()
+    fun loadPendingPrivateKey(): String?
+    fun savePendingPrivateKey(privateKey: String)
+    fun clearPendingPrivateKey()
+    fun loadDeviceToken(): String?
+    fun saveDeviceToken(token: String)
+    fun clearDeviceToken()
+    fun resetIdentity(): String
+}
+
 /** Stores the device identity and control-plane credential encrypted with Android Keystore. */
-class SecureIdentityStore(context: Context) {
+class SecureIdentityStore(context: Context) : IdentityStorage {
     private val prefs = context.getSharedPreferences(NAME, Context.MODE_PRIVATE)
 
-    fun getOrCreateDeviceId(): String {
+    override fun getOrCreateDeviceId(): String {
         prefs.getString(KEY_DEVICE_ID, null)?.let { return it }
         val deviceId = UUID.randomUUID().toString()
         prefs.edit { putString(KEY_DEVICE_ID, deviceId) }
         return deviceId
     }
 
-    fun loadPrivateKey(): String? = loadEncrypted(KEY_PRIVATE_KEY_CIPHERTEXT, KEY_PRIVATE_KEY_IV)
+    override fun loadPrivateKey(): String? = loadEncrypted(KEY_PRIVATE_KEY_CIPHERTEXT, KEY_PRIVATE_KEY_IV)
 
-    fun savePrivateKey(privateKey: String) = saveEncrypted(KEY_PRIVATE_KEY_CIPHERTEXT, KEY_PRIVATE_KEY_IV, privateKey)
+    override fun savePrivateKey(privateKey: String) = saveEncrypted(KEY_PRIVATE_KEY_CIPHERTEXT, KEY_PRIVATE_KEY_IV, privateKey)
 
-    fun clearPrivateKey() {
+    override fun clearPrivateKey() {
         prefs.edit {
             remove(KEY_PRIVATE_KEY_CIPHERTEXT)
             remove(KEY_PRIVATE_KEY_IV)
@@ -37,31 +51,31 @@ class SecureIdentityStore(context: Context) {
         }
     }
 
-    fun loadPendingPrivateKey(): String? =
+    override fun loadPendingPrivateKey(): String? =
         loadEncrypted(KEY_PENDING_PRIVATE_KEY_CIPHERTEXT, KEY_PENDING_PRIVATE_KEY_IV)
 
-    fun savePendingPrivateKey(privateKey: String) =
+    override fun savePendingPrivateKey(privateKey: String) =
         saveEncrypted(KEY_PENDING_PRIVATE_KEY_CIPHERTEXT, KEY_PENDING_PRIVATE_KEY_IV, privateKey)
 
-    fun clearPendingPrivateKey() {
+    override fun clearPendingPrivateKey() {
         prefs.edit {
             remove(KEY_PENDING_PRIVATE_KEY_CIPHERTEXT)
             remove(KEY_PENDING_PRIVATE_KEY_IV)
         }
     }
 
-    fun loadDeviceToken(): String? = loadEncrypted(KEY_DEVICE_TOKEN_CIPHERTEXT, KEY_DEVICE_TOKEN_IV)
+    override fun loadDeviceToken(): String? = loadEncrypted(KEY_DEVICE_TOKEN_CIPHERTEXT, KEY_DEVICE_TOKEN_IV)
 
-    fun saveDeviceToken(token: String) = saveEncrypted(KEY_DEVICE_TOKEN_CIPHERTEXT, KEY_DEVICE_TOKEN_IV, token)
+    override fun saveDeviceToken(token: String) = saveEncrypted(KEY_DEVICE_TOKEN_CIPHERTEXT, KEY_DEVICE_TOKEN_IV, token)
 
-    fun clearDeviceToken() {
+    override fun clearDeviceToken() {
         prefs.edit {
             remove(KEY_DEVICE_TOKEN_CIPHERTEXT)
             remove(KEY_DEVICE_TOKEN_IV)
         }
     }
 
-    fun resetIdentity(): String {
+    override fun resetIdentity(): String {
         val newDeviceId = UUID.randomUUID().toString()
         prefs.edit {
             putString(KEY_DEVICE_ID, newDeviceId)

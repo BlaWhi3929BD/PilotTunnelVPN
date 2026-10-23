@@ -77,6 +77,43 @@ class ControlPlaneClientTest {
     }
 
     @Test
+    fun registerDevice_nullDeviceTokenOnRepeatProvisionReturnsNullNotLiteralNullString() {
+        server.createContext("/v1/devices") { exchange ->
+            val response = """
+                {
+                    "status": "accepted",
+                    "device_id": "dev-1",
+                    "client_address": "10.67.0.2/32",
+                    "provisioned": true,
+                    "registered_at": "2026-10-23T20:00:00Z",
+                    "device_token": null,
+                    "server": {
+                        "id": "srv-1",
+                        "region": "dev",
+                        "hostname": "127.0.0.1",
+                        "public_key": "srv-pubkey",
+                        "port": 51820
+                    }
+                }
+            """.trimIndent()
+            val bytes = response.toByteArray(Charsets.UTF_8)
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.write(bytes)
+            exchange.close()
+        }
+
+        val client = ControlPlaneClient("http://127.0.0.1:$serverPort")
+        val result = client.registerDevice(
+            deviceId = "dev-1",
+            publicKey = "client-pubkey",
+            appVersion = "0.2.0",
+            deviceToken = "existing-valid-token",
+        )
+
+        org.junit.Assert.assertNull(result.deviceToken)
+    }
+
+    @Test
     fun rotateDevice_success() {
         var receivedTokenHeader: String? = null
         var receivedBody: String? = null
@@ -262,21 +299,48 @@ class ControlPlaneClientTest {
         assertFalse(DebugCliProvider.isAllowedCallerUid(uid = 2000, appUid = 10234, isDebugBuild = false))
     }
 
+    private fun resolveAppFile(relativeToApp: String): java.io.File {
+        val direct = java.io.File(relativeToApp)
+        if (direct.exists()) return direct
+        val fromRoot = java.io.File("app/$relativeToApp")
+        if (fromRoot.exists()) return fromRoot
+        return direct
+    }
+
     @Test
-    fun releaseManifest_excludesDebugCliProviderAndCleartextTraffic() {
-        val mainManifest = java.io.File("src/main/AndroidManifest.xml")
-        if (mainManifest.exists()) {
-            val content = mainManifest.readText()
-            assertFalse(content.contains("DebugCliProvider"))
-            assertFalse(content.contains("usesCleartextTraffic"))
-        }
-        val mergedReleaseManifest = java.io.File(
+    fun sourceManifests_enforceDebugOnlyCliProviderAndCleartextTraffic() {
+        val mainManifest = resolveAppFile("src/main/AndroidManifest.xml")
+        assertTrue(
+            "Main AndroidManifest.xml must exist at ${mainManifest.absolutePath}",
+            mainManifest.exists(),
+        )
+        val mainContent = mainManifest.readText()
+        assertFalse(mainContent.contains("DebugCliProvider"))
+        assertFalse(mainContent.contains("usesCleartextTraffic"))
+
+        val debugManifest = resolveAppFile("src/debug/AndroidManifest.xml")
+        assertTrue(
+            "Debug AndroidManifest.xml must exist at ${debugManifest.absolutePath}",
+            debugManifest.exists(),
+        )
+        val debugContent = debugManifest.readText()
+        assertTrue(debugContent.contains("DebugCliProvider"))
+        assertTrue(debugContent.contains("usesCleartextTraffic=\"true\""))
+    }
+
+    @Test
+    fun mergedReleaseManifest_excludesDebugCliProviderAndCleartextTraffic() {
+        val mergedReleaseManifest = resolveAppFile(
             "build/intermediates/merged_manifest/release/processReleaseMainManifest/AndroidManifest.xml",
         )
-        if (mergedReleaseManifest.exists()) {
-            val releaseContent = mergedReleaseManifest.readText()
-            assertFalse(releaseContent.contains("DebugCliProvider"))
-            assertFalse(releaseContent.contains("usesCleartextTraffic"))
-        }
+        assertTrue(
+            "Merged release manifest artifact is missing at ${mergedReleaseManifest.absolutePath}; " +
+                "ensure :app:processReleaseMainManifest runs before unit tests",
+            mergedReleaseManifest.exists(),
+        )
+        val releaseContent = mergedReleaseManifest.readText()
+        assertTrue(releaseContent.contains("com.blawhi3929bd.tunnelpilot.MainActivity"))
+        assertFalse(releaseContent.contains("DebugCliProvider"))
+        assertFalse(releaseContent.contains("usesCleartextTraffic"))
     }
 }

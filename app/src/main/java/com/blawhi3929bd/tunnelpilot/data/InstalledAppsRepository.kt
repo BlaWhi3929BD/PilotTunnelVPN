@@ -4,13 +4,17 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 
+interface InstalledAppsProvider {
+    fun getLaunchableApps(): List<InstalledApp>
+}
+
 class InstalledAppsRepository(
     context: Context,
     private val ownPackageName: String = context.packageName,
-) {
+) : InstalledAppsProvider {
     private val packageManager = context.packageManager
 
-    fun getLaunchableApps(): List<InstalledApp> {
+    override fun getLaunchableApps(): List<InstalledApp> {
         val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
         return packageManager
             .queryIntentActivities(intent, PackageManager.MATCH_ALL)

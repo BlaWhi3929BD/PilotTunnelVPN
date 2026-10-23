@@ -6,6 +6,7 @@ sealed interface ProvisioningState {
     data class Provisioned(
         val deviceId: String,
         val clientAddress: String,
+        val lastError: String? = null,
     ) : ProvisioningState
     data class Error(val message: String) : ProvisioningState
 }

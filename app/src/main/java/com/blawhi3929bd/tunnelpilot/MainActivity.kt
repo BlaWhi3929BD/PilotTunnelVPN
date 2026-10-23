@@ -317,6 +317,13 @@ private fun SetupSection(
                 Text("Device ID: ${provisioningState.deviceId}")
                 Text("VPN address: ${provisioningState.clientAddress}")
                 Text("The generated configuration is stored encrypted locally.")
+                if (provisioningState.lastError != null) {
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        provisioningState.lastError,
+                        color = MaterialTheme.colorScheme.error,
+                    )
+                }
             }
             is ProvisioningState.Error -> {
                 Text(

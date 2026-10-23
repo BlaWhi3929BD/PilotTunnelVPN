@@ -80,3 +80,7 @@ dependencies {
     androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
+
+tasks.withType<Test>().configureEach {
+    dependsOn("processReleaseMainManifest")
+}

@@ -92,6 +92,23 @@ class DebugCliProvider : ContentProvider() {
                         }.ifEmpty { "no_servers" }
                     }
                 }
+                "probe_http" -> runCatching {
+                    val targetUrl = requireNotNull(arg?.trim()?.takeIf { it.isNotEmpty() }) {
+                        "Missing URL argument for probe_http"
+                    }
+                    val conn = (java.net.URI(targetUrl).toURL().openConnection() as java.net.HttpURLConnection).apply {
+                        requestMethod = "GET"
+                        connectTimeout = 2_500
+                        readTimeout = 2_500
+                    }
+                    try {
+                        val code = conn.responseCode
+                        val body = conn.inputStream.bufferedReader(Charsets.UTF_8).use { it.readText().trim() }
+                        "http_status=$code body=$body app_uid=${Process.myUid()}"
+                    } finally {
+                        conn.disconnect()
+                    }
+                }
                 else -> Result.failure(IllegalArgumentException("Unknown CLI method: $method"))
             }
 

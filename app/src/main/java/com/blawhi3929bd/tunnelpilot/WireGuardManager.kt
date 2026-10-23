@@ -8,23 +8,30 @@ import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
 import java.io.ByteArrayInputStream
 
-class WireGuardManager(context: Context) {
+interface TunnelBackend {
+    fun connect(configText: String)
+    fun disconnect()
+    fun currentState(): Tunnel.State
+    fun statistics(): Statistics?
+}
+
+class WireGuardManager(context: Context) : TunnelBackend {
     private val tunnel = WireGuardTunnel { state -> lastState = state }
     private val backend: Backend = GoBackend(context.applicationContext)
 
     @Volatile
     private var lastState: Tunnel.State = Tunnel.State.DOWN
 
-    fun connect(configText: String) {
+    override fun connect(configText: String) {
         val config = Config.parse(ByteArrayInputStream(configText.toByteArray(Charsets.UTF_8)))
         backend.setState(tunnel, Tunnel.State.UP, config)
     }
 
-    fun disconnect() {
+    override fun disconnect() {
         backend.setState(tunnel, Tunnel.State.DOWN, null)
     }
 
-    fun currentState(): Tunnel.State = lastState
+    override fun currentState(): Tunnel.State = lastState
 
-    fun statistics(): Statistics? = runCatching { backend.getStatistics(tunnel) }.getOrNull()
+    override fun statistics(): Statistics? = runCatching { backend.getStatistics(tunnel) }.getOrNull()
 }

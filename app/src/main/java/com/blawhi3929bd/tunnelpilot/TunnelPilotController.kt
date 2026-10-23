@@ -4,11 +4,16 @@ import android.content.Context
 import android.content.Intent
 import android.net.VpnService
 import com.blawhi3929bd.tunnelpilot.data.AppSettingsStore
+import com.blawhi3929bd.tunnelpilot.data.ConfigStorage
 import com.blawhi3929bd.tunnelpilot.data.InstalledApp
+import com.blawhi3929bd.tunnelpilot.data.InstalledAppsProvider
 import com.blawhi3929bd.tunnelpilot.data.InstalledAppsRepository
 import com.blawhi3929bd.tunnelpilot.data.SecureConfigStore
+import com.blawhi3929bd.tunnelpilot.data.SettingsStorage
+import com.blawhi3929bd.tunnelpilot.provisioning.ControlPlaneApi
 import com.blawhi3929bd.tunnelpilot.provisioning.ControlPlaneClient
 import com.blawhi3929bd.tunnelpilot.provisioning.ControlPlaneHttpException
+import com.blawhi3929bd.tunnelpilot.provisioning.IdentityStorage
 import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
 import com.blawhi3929bd.tunnelpilot.provisioning.RegisteredServer
 import com.blawhi3929bd.tunnelpilot.provisioning.SecureIdentityStore
@@ -47,14 +52,27 @@ data class ControllerStatusSnapshot(
     val vpnPermissionRequired: Boolean,
 )
 
-class TunnelPilotController private constructor(context: Context) {
-    private val appContext = context.applicationContext
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private val manager = WireGuardManager(appContext)
-    private val configStore = SecureConfigStore(appContext)
-    private val settingsStore = AppSettingsStore(appContext)
-    private val identityStore = SecureIdentityStore(appContext)
-    private val installedAppsRepository = InstalledAppsRepository(appContext)
+class TunnelPilotController internal constructor(
+    private val manager: TunnelBackend,
+    private val configStore: ConfigStorage,
+    private val settingsStore: SettingsStorage,
+    private val identityStore: IdentityStorage,
+    private val installedAppsRepository: InstalledAppsProvider,
+    private val controlPlaneClientFactory: (String) -> ControlPlaneApi = { ControlPlaneClient(it) },
+    private val vpnPermissionChecker: () -> Intent? = { null },
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+    startBackgroundTasks: Boolean = true,
+) {
+    private constructor(context: Context) : this(
+        manager = WireGuardManager(context.applicationContext),
+        configStore = SecureConfigStore(context.applicationContext),
+        settingsStore = AppSettingsStore(context.applicationContext),
+        identityStore = SecureIdentityStore(context.applicationContext),
+        installedAppsRepository = InstalledAppsRepository(context.applicationContext),
+        controlPlaneClientFactory = { ControlPlaneClient(it) },
+        vpnPermissionChecker = { VpnService.prepare(context.applicationContext) },
+    )
+
     private val operationMutex = Mutex()
     private val catalogMutex = Mutex()
 
@@ -79,7 +97,7 @@ class TunnelPilotController private constructor(context: Context) {
     private val _controlPlaneUrl = MutableStateFlow(settingsStore.getControlPlaneUrl())
     val controlPlaneUrl: StateFlow<String> = _controlPlaneUrl.asStateFlow()
 
-    private val _provisioningState = MutableStateFlow(loadInitialProvisioningState())
+    private val _provisioningState = MutableStateFlow(loadPersistedProvisioningState())
     val provisioningState: StateFlow<ProvisioningState> = _provisioningState.asStateFlow()
 
     private val _servers = MutableStateFlow<List<RegisteredServer>>(emptyList())
@@ -94,31 +112,48 @@ class TunnelPilotController private constructor(context: Context) {
     private var statsJob: Job? = null
 
     init {
-        refreshInstalledApps()
-        scope.launch {
-            if (manager.currentState() == Tunnel.State.UP) {
-                updateStats()
-                startStatsPolling()
+        if (startBackgroundTasks) {
+            refreshInstalledApps()
+            scope.launch {
+                if (manager.currentState() == Tunnel.State.UP) {
+                    updateStats()
+                    startStatsPolling()
+                }
             }
+        } else if (manager.currentState() == Tunnel.State.UP) {
+            updateStats()
         }
     }
 
-    private fun loadInitialProvisioningState(): ProvisioningState {
-        val rawConfig = configStore.load() ?: return ProvisioningState.NotConfigured
-        if (identityStore.loadDeviceToken() == null) return ProvisioningState.NotConfigured
-        val address = rawConfig
+    private fun extractClientAddress(rawConfig: String?): String? {
+        if (rawConfig == null) return null
+        return rawConfig
             .lineSequence()
             .firstOrNull { it.trim().startsWith("Address", ignoreCase = true) }
             ?.substringAfter("=")
             ?.trim()
-            ?: "configured"
+            ?.takeIf { it.isNotEmpty() }
+    }
+
+    private fun loadPersistedProvisioningState(lastError: String? = null): ProvisioningState {
+        val rawConfig = configStore.load() ?: return ProvisioningState.NotConfigured
+        if (identityStore.loadDeviceToken() == null) return ProvisioningState.NotConfigured
+        val address = extractClientAddress(rawConfig) ?: "configured"
         return ProvisioningState.Provisioned(
             deviceId = identityStore.getOrCreateDeviceId(),
             clientAddress = address,
+            lastError = lastError,
         )
     }
 
-    fun requiredVpnPermissionIntent(): Intent? = VpnService.prepare(appContext)
+    private fun resolveProvisioningStateAfterFailure(message: String): ProvisioningState {
+        return when (val persisted = loadPersistedProvisioningState(lastError = message)) {
+            is ProvisioningState.Provisioned -> persisted
+            else -> ProvisioningState.Error(message)
+        }
+    }
+
+    fun requiredVpnPermissionIntent(): Intent? = vpnPermissionChecker()
 
     fun refreshInstalledApps() {
         scope.launch(Dispatchers.Default) {
@@ -159,8 +194,9 @@ class TunnelPilotController private constructor(context: Context) {
     fun setControlPlaneUrl(url: String) {
         _controlPlaneUrl.value = url
         settingsStore.setControlPlaneUrl(url)
-        if (_provisioningState.value is ProvisioningState.Error) {
-            _provisioningState.value = loadInitialProvisioningState()
+        val current = _provisioningState.value
+        if (current is ProvisioningState.Error || (current is ProvisioningState.Provisioned && current.lastError != null)) {
+            _provisioningState.value = loadPersistedProvisioningState(lastError = null)
         }
         _serversError.value = null
     }
@@ -175,7 +211,7 @@ class TunnelPilotController private constructor(context: Context) {
         runCatching {
             val baseUrl = _controlPlaneUrl.value.trim()
             require(baseUrl.isNotBlank()) { "Control plane URL is required" }
-            val fetched = ControlPlaneClient(baseUrl).listServers()
+            val fetched = controlPlaneClientFactory(baseUrl).listServers()
             _servers.value = fetched
             _serversLoaded.value = true
             _serversError.value = null
@@ -195,7 +231,7 @@ class TunnelPilotController private constructor(context: Context) {
         syncBackendState()
         if (_state.value.isActive()) {
             val msg = "Disconnect the VPN before provisioning a new configuration"
-            _provisioningState.value = ProvisioningState.Error(msg)
+            _provisioningState.value = resolveProvisioningStateAfterFailure(msg)
             return@withLock Result.failure(IllegalStateException(msg))
         }
 
@@ -213,7 +249,7 @@ class TunnelPilotController private constructor(context: Context) {
 
             val baseUrl = _controlPlaneUrl.value.trim()
             require(baseUrl.isNotBlank()) { "Control plane URL is required" }
-            val client = ControlPlaneClient(baseUrl)
+            val client = controlPlaneClientFactory(baseUrl)
 
             val publicKey = TunnelPilotKeyGenerator.generatePublicKey(
                 com.wireguard.crypto.Key.fromBase64(activePrivateKey),
@@ -271,11 +307,12 @@ class TunnelPilotController private constructor(context: Context) {
             val provisioned = ProvisioningState.Provisioned(
                 deviceId = registration.deviceId,
                 clientAddress = registration.clientAddress,
+                lastError = null,
             )
             _provisioningState.value = provisioned
             provisioned
         }.onFailure { error ->
-            _provisioningState.value = ProvisioningState.Error(
+            _provisioningState.value = resolveProvisioningStateAfterFailure(
                 error.message ?: "Unable to provision the device",
             )
         }
@@ -291,7 +328,7 @@ class TunnelPilotController private constructor(context: Context) {
         syncBackendState()
         if (_state.value.isActive()) {
             val msg = "Disconnect the VPN before rotating the client key"
-            _provisioningState.value = ProvisioningState.Error(msg)
+            _provisioningState.value = resolveProvisioningStateAfterFailure(msg)
             return@withLock Result.failure(IllegalStateException(msg))
         }
 
@@ -317,9 +354,10 @@ class TunnelPilotController private constructor(context: Context) {
             ).toBase64()
             val baseUrl = _controlPlaneUrl.value.trim()
             require(baseUrl.isNotBlank()) { "Control plane URL is required" }
+            val client = controlPlaneClientFactory(baseUrl)
 
             val rotation = try {
-                ControlPlaneClient(baseUrl).rotateDevice(
+                client.rotateDevice(
                     deviceId = deviceId,
                     publicKey = newPublicKey,
                     appVersion = BuildConfig.VERSION_NAME,
@@ -338,21 +376,22 @@ class TunnelPilotController private constructor(context: Context) {
                     server = rotation.server,
                 )
                 Config.parse(ByteArrayInputStream(config.toByteArray(Charsets.UTF_8)))
+                configStore.save(config)
                 identityStore.savePrivateKey(newPrivateKey)
                 identityStore.clearPendingPrivateKey()
-                configStore.save(config)
                 _configPresent.value = true
                 _reconnectRequired.value = false
                 val provisioned = ProvisioningState.Provisioned(
                     deviceId = rotation.deviceId,
                     clientAddress = rotation.clientAddress,
+                    lastError = null,
                 )
                 _provisioningState.value = provisioned
                 provisioned
             } catch (localFailure: Exception) {
                 if (oldPublicKey != null) {
                     runCatching {
-                        ControlPlaneClient(baseUrl).rotateDevice(
+                        client.rotateDevice(
                             deviceId = deviceId,
                             publicKey = oldPublicKey,
                             appVersion = BuildConfig.VERSION_NAME,
@@ -366,7 +405,7 @@ class TunnelPilotController private constructor(context: Context) {
                 throw localFailure
             }
         }.onFailure { error ->
-            _provisioningState.value = ProvisioningState.Error(
+            _provisioningState.value = resolveProvisioningStateAfterFailure(
                 error.message ?: "Unable to rotate the device key",
             )
         }
@@ -407,9 +446,9 @@ class TunnelPilotController private constructor(context: Context) {
                     require(baseUrl.isNotBlank()) {
                         "Control plane URL is required to revoke the device on the server"
                     }
-                    ControlPlaneClient(baseUrl).revokeDevice(deviceId, token)
+                    controlPlaneClientFactory(baseUrl).revokeDevice(deviceId, token)
                 } else if (baseUrl.isNotBlank()) {
-                    runCatching { ControlPlaneClient(baseUrl).revokeDevice(deviceId, token) }
+                    runCatching { controlPlaneClientFactory(baseUrl).revokeDevice(deviceId, token) }
                 }
             }
             configStore.clear()
@@ -419,7 +458,7 @@ class TunnelPilotController private constructor(context: Context) {
             _reconnectRequired.value = false
             _provisioningState.value = ProvisioningState.NotConfigured
         }.onFailure { error ->
-            _provisioningState.value = ProvisioningState.Error(
+            _provisioningState.value = resolveProvisioningStateAfterFailure(
                 "Revocation failed; local credentials preserved: ${error.message ?: "Unknown error"}",
             )
         }
@@ -450,9 +489,9 @@ class TunnelPilotController private constructor(context: Context) {
                     require(baseUrl.isNotBlank()) {
                         "Control plane URL is required to revoke the existing device before resetting identity"
                     }
-                    ControlPlaneClient(baseUrl).revokeDevice(oldDeviceId, oldToken)
+                    controlPlaneClientFactory(baseUrl).revokeDevice(oldDeviceId, oldToken)
                 } else if (baseUrl.isNotBlank()) {
-                    runCatching { ControlPlaneClient(baseUrl).revokeDevice(oldDeviceId, oldToken) }
+                    runCatching { controlPlaneClientFactory(baseUrl).revokeDevice(oldDeviceId, oldToken) }
                 }
             }
             configStore.clear()
@@ -462,7 +501,7 @@ class TunnelPilotController private constructor(context: Context) {
             _provisioningState.value = ProvisioningState.NotConfigured
             newDeviceId
         }.onFailure { error ->
-            _provisioningState.value = ProvisioningState.Error(
+            _provisioningState.value = resolveProvisioningStateAfterFailure(
                 "Identity reset aborted because server revocation failed; local token preserved: ${error.message ?: "Unknown error"}",
             )
         }
@@ -532,9 +571,9 @@ class TunnelPilotController private constructor(context: Context) {
         }
         val (provLabel, clientAddr, provErr) = when (currentProv) {
             ProvisioningState.NotConfigured -> Triple("NotConfigured", null, null)
-            ProvisioningState.Provisioning -> Triple("Provisioning", null, null)
-            is ProvisioningState.Provisioned -> Triple("Provisioned", currentProv.clientAddress, null)
-            is ProvisioningState.Error -> Triple("Error", null, currentProv.message)
+            ProvisioningState.Provisioning -> Triple("Provisioning", extractClientAddress(configStore.load()), null)
+            is ProvisioningState.Provisioned -> Triple("Provisioned", currentProv.clientAddress, currentProv.lastError)
+            is ProvisioningState.Error -> Triple("Error", extractClientAddress(configStore.load()), currentProv.message)
         }
         return ControllerStatusSnapshot(
             vpnState = vpnLabel,
@@ -585,6 +624,11 @@ class TunnelPilotController private constructor(context: Context) {
             setError(msg)
             return Result.failure(IllegalStateException(msg))
         }
+        if (_routingMode.value == RoutingMode.SELECTED_APPS && _selectedApps.value.isEmpty()) {
+            val msg = "Select at least one app for Selected apps mode"
+            setError(msg)
+            return Result.failure(IllegalStateException(msg))
+        }
 
         _state.value = VpnState.Connecting
         return try {
@@ -631,7 +675,9 @@ class TunnelPilotController private constructor(context: Context) {
 
     private fun syncBackendState() {
         if (manager.currentState() == Tunnel.State.UP) {
-            updateStats()
+            if (_state.value !is VpnState.Error) {
+                updateStats()
+            }
         } else if (_state.value is VpnState.Connected) {
             statsJob?.cancel()
             statsJob = null

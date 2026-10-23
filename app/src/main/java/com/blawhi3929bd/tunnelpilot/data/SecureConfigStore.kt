@@ -12,11 +12,17 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
+interface ConfigStorage {
+    fun save(config: String)
+    fun load(): String?
+    fun clear()
+}
+
 /** Stores a WireGuard client configuration encrypted by an Android Keystore AES key. */
-class SecureConfigStore(context: Context) {
+class SecureConfigStore(context: Context) : ConfigStorage {
     private val prefs = context.getSharedPreferences("vpn_secure_config", Context.MODE_PRIVATE)
 
-    fun save(config: String) {
+    override fun save(config: String) {
         val cipher = Cipher.getInstance(TRANSFORMATION)
         cipher.init(Cipher.ENCRYPT_MODE, key())
         val ciphertext = cipher.doFinal(config.toByteArray(StandardCharsets.UTF_8))
@@ -26,7 +32,7 @@ class SecureConfigStore(context: Context) {
         }
     }
 
-    fun load(): String? {
+    override fun load(): String? {
         val ciphertext = prefs.getString(KEY_CIPHERTEXT, null) ?: return null
         val iv = prefs.getString(KEY_IV, null) ?: return null
         return runCatching {
@@ -44,7 +50,7 @@ class SecureConfigStore(context: Context) {
         }
     }
 
-    fun clear() {
+    override fun clear() {
         prefs.edit { clear() }
     }
 

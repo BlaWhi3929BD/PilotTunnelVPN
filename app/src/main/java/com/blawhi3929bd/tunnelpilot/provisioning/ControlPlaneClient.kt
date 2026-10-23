@@ -8,6 +8,29 @@ import java.net.HttpURLConnection
 import java.net.URI
 import java.net.URL
 
+interface ControlPlaneApi {
+    fun registerDevice(
+        deviceId: String,
+        publicKey: String,
+        appVersion: String,
+        deviceToken: String? = null,
+    ): RegistrationResult
+
+    fun rotateDevice(
+        deviceId: String,
+        publicKey: String,
+        appVersion: String,
+        deviceToken: String,
+    ): RotationResult
+
+    fun revokeDevice(
+        deviceId: String,
+        deviceToken: String,
+    ): Boolean
+
+    fun listServers(): List<RegisteredServer>
+}
+
 class ControlPlaneHttpException(
     val statusCode: Int,
     message: String,
@@ -17,12 +40,12 @@ class ControlPlaneClient(
     private val baseUrl: String,
     private val connectTimeoutMs: Int = 8_000,
     private val readTimeoutMs: Int = 8_000,
-) {
-    fun registerDevice(
+) : ControlPlaneApi {
+    override fun registerDevice(
         deviceId: String,
         publicKey: String,
         appVersion: String,
-        deviceToken: String? = null,
+        deviceToken: String?,
     ): RegistrationResult {
         require(deviceId.isNotBlank()) { "Device ID is required" }
         require(publicKey.isNotBlank()) { "WireGuard public key is required" }
@@ -65,7 +88,7 @@ class ControlPlaneClient(
     }
 
 
-    fun rotateDevice(
+    override fun rotateDevice(
         deviceId: String,
         publicKey: String,
         appVersion: String,
@@ -109,7 +132,7 @@ class ControlPlaneClient(
         }
     }
 
-    fun revokeDevice(
+    override fun revokeDevice(
         deviceId: String,
         deviceToken: String,
     ): Boolean {
@@ -137,7 +160,7 @@ class ControlPlaneClient(
         }
     }
 
-    fun listServers(): List<RegisteredServer> {
+    override fun listServers(): List<RegisteredServer> {
         val url = endpoint("/v1/servers")
         val connection = (url.openConnection() as HttpURLConnection).apply {
             requestMethod = "GET"
@@ -245,12 +268,17 @@ class ControlPlaneClient(
     private fun parseRegistration(body: String): RegistrationResult {
         val json = JSONObject(body)
         val serverJson = json.getJSONObject("server")
+        val rawToken = if (json.isNull("device_token")) {
+            null
+        } else {
+            json.optString("device_token").trim().takeIf { it.isNotEmpty() && !it.equals("null", ignoreCase = true) }
+        }
         return RegistrationResult(
             deviceId = json.getString("device_id"),
             clientAddress = json.getString("client_address"),
             provisioned = json.getBoolean("provisioned"),
             server = parseServer(serverJson),
-            deviceToken = json.optString("device_token").ifBlank { null },
+            deviceToken = rawToken,
         )
     }
 }

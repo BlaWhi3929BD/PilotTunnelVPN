@@ -1,0 +1,477 @@
+package com.blawhi3929bd.tunnelpilot
+
+import com.blawhi3929bd.tunnelpilot.data.ConfigStorage
+import com.blawhi3929bd.tunnelpilot.data.InstalledApp
+import com.blawhi3929bd.tunnelpilot.data.InstalledAppsProvider
+import com.blawhi3929bd.tunnelpilot.data.SettingsStorage
+import com.blawhi3929bd.tunnelpilot.provisioning.ControlPlaneApi
+import com.blawhi3929bd.tunnelpilot.provisioning.ControlPlaneHttpException
+import com.blawhi3929bd.tunnelpilot.provisioning.IdentityStorage
+import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
+import com.blawhi3929bd.tunnelpilot.provisioning.RegisteredServer
+import com.blawhi3929bd.tunnelpilot.provisioning.RegistrationResult
+import com.blawhi3929bd.tunnelpilot.provisioning.RotationResult
+import com.wireguard.android.backend.Statistics
+import com.wireguard.android.backend.Tunnel
+import com.wireguard.crypto.TunnelPilotKeyGenerator
+import kotlinx.coroutines.runBlocking
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Before
+import org.junit.Test
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.util.UUID
+
+class TunnelPilotControllerTest {
+
+    private lateinit var backend: FakeTunnelBackend
+    private lateinit var configStore: FakeConfigStorage
+    private lateinit var settingsStore: FakeSettingsStorage
+    private lateinit var identityStore: FakeIdentityStorage
+    private lateinit var appsProvider: FakeInstalledAppsProvider
+    private lateinit var controlPlane: FakeControlPlaneApi
+
+    private val serverPublicKey = TunnelPilotKeyGenerator.generatePublicKey(
+        TunnelPilotKeyGenerator.generatePrivateKey(),
+    ).toBase64()
+    private val defaultServer by lazy {
+        RegisteredServer(
+            id = "srv-1",
+            region = "dev",
+            hostname = "10.33.209.129",
+            publicKey = serverPublicKey,
+            port = 51820,
+            healthStatus = "ok",
+            peerCount = 1,
+            peerCapacity = 240,
+            capacityRemaining = 239,
+        )
+    }
+
+    @Before
+    fun setUp() {
+        backend = FakeTunnelBackend()
+        configStore = FakeConfigStorage()
+        settingsStore = FakeSettingsStorage()
+        identityStore = FakeIdentityStorage()
+        appsProvider = FakeInstalledAppsProvider(
+            listOf(
+                InstalledApp(packageName = "com.example.allowed", label = "Allowed App"),
+                InstalledApp(packageName = "com.example.second", label = "Second App"),
+            ),
+        )
+        controlPlane = FakeControlPlaneApi(defaultServer)
+    }
+
+    private fun createController(): TunnelPilotController = TunnelPilotController(
+        manager = backend,
+        configStore = configStore,
+        settingsStore = settingsStore,
+        identityStore = identityStore,
+        installedAppsRepository = appsProvider,
+        controlPlaneClientFactory = { controlPlane },
+        vpnPermissionChecker = { null },
+        startBackgroundTasks = false,
+    )
+
+    @Test
+    fun networkFailures_preserveExistingProvisionedStateAndClientAddress() = runBlocking {
+        val controller = createController()
+
+        // 1. Initial provisioning succeeds
+        val initial = controller.provisionNow()
+        assertTrue(initial.isSuccess)
+        val savedConfigBefore = configStore.load()
+        assertNotNull(savedConfigBefore)
+        assertEquals("Provisioned", controller.statusSnapshot().provisioningStatus)
+        assertEquals("10.67.0.2/32", controller.statusSnapshot().clientAddress)
+        assertNull(controller.statusSnapshot().errorMessage)
+
+        // 2. Unreachable Control Plane (ConnectException) during re-provision
+        controlPlane.registerBehavior = { _, _, _, _ ->
+            throw ConnectException("Failed to connect to /127.0.0.1:8000")
+        }
+        val unreachableResult = controller.provisionNow()
+        assertTrue(unreachableResult.isFailure)
+        val snapUnreachable = controller.statusSnapshot()
+        assertEquals("Provisioned", snapUnreachable.provisioningStatus)
+        assertEquals("10.67.0.2/32", snapUnreachable.clientAddress)
+        assertTrue(snapUnreachable.configPresent)
+        assertTrue(snapUnreachable.hasDeviceToken)
+        assertEquals(savedConfigBefore, configStore.load())
+        assertTrue(snapUnreachable.errorMessage!!.contains("Failed to connect"))
+        val provStateUnreachable = controller.provisioningState.value as ProvisioningState.Provisioned
+        assertEquals("10.67.0.2/32", provStateUnreachable.clientAddress)
+        assertTrue(provStateUnreachable.lastError!!.contains("Failed to connect"))
+
+        // 3. HTTP 401, 409, and 503 errors preserve Provisioned state and clientAddress
+        for (code in listOf(401, 409, 503)) {
+            controlPlane.registerBehavior = { _, _, _, _ ->
+                throw ControlPlaneHttpException(code, "HTTP $code error from server")
+            }
+            if (code == 409) {
+                controlPlane.rotateBehavior = { _, _, _, _ ->
+                    throw ControlPlaneHttpException(409, "HTTP 409 conflict on rotate")
+                }
+            }
+            val httpResult = controller.provisionNow()
+            assertTrue(httpResult.isFailure)
+            val snapHttp = controller.statusSnapshot()
+            assertEquals("Provisioned", snapHttp.provisioningStatus)
+            assertEquals("10.67.0.2/32", snapHttp.clientAddress)
+            assertEquals(savedConfigBefore, configStore.load())
+            assertTrue(snapHttp.errorMessage!!.contains("HTTP $code"))
+        }
+
+        // 4. Timeout after sending request preserves Provisioned state and clientAddress
+        controlPlane.registerBehavior = { _, _, _, _ ->
+            throw SocketTimeoutException("Read timed out")
+        }
+        val timeoutResult = controller.provisionNow()
+        assertTrue(timeoutResult.isFailure)
+        val snapTimeout = controller.statusSnapshot()
+        assertEquals("Provisioned", snapTimeout.provisioningStatus)
+        assertEquals("10.67.0.2/32", snapTimeout.clientAddress)
+        assertEquals(savedConfigBefore, configStore.load())
+        assertTrue(snapTimeout.errorMessage!!.contains("Read timed out"))
+
+        // 5. Attempting provision while VPN is Connected preserves Provisioned + Connected + clientAddress
+        assertTrue(controller.connectNow().isSuccess)
+        assertEquals("Connected", controller.statusSnapshot().vpnState)
+        val whileConnected = controller.provisionNow()
+        assertTrue(whileConnected.isFailure)
+        val snapConnected = controller.statusSnapshot()
+        assertEquals("Connected", snapConnected.vpnState)
+        assertEquals("Provisioned", snapConnected.provisioningStatus)
+        assertEquals("10.67.0.2/32", snapConnected.clientAddress)
+        assertTrue(snapConnected.errorMessage!!.contains("Disconnect the VPN"))
+
+        // 6. Disconnect and retry when Control Plane recovers -> clears lastError
+        assertTrue(controller.disconnectNow().isSuccess)
+        controlPlane.resetDefaultBehaviors()
+        val recovered = controller.provisionNow()
+        assertTrue(recovered.isSuccess)
+        val snapRecovered = controller.statusSnapshot()
+        assertEquals("Provisioned", snapRecovered.provisioningStatus)
+        assertEquals("10.67.0.2/32", snapRecovered.clientAddress)
+        assertNull(snapRecovered.errorMessage)
+        assertNull((controller.provisioningState.value as ProvisioningState.Provisioned).lastError)
+    }
+
+    @Test
+    fun unprovisionedDeviceFailure_reportsErrorStateAndNullClientAddress() = runBlocking {
+        val controller = createController()
+        controlPlane.registerBehavior = { _, _, _, _ ->
+            throw ConnectException("Connection refused")
+        }
+
+        val res = controller.provisionNow()
+        assertTrue(res.isFailure)
+        val snap = controller.statusSnapshot()
+        assertEquals("Error", snap.provisioningStatus)
+        assertNull(snap.clientAddress)
+        assertFalse(snap.configPresent)
+        assertTrue(snap.errorMessage!!.contains("Connection refused"))
+    }
+
+    @Test
+    fun selectedAppsMode_enforcesEmptyValidMissingAndReconnectErrorScenarios() = runBlocking {
+        val controller = createController()
+        assertTrue(controller.provisionNow().isSuccess)
+
+        // 1. Empty selectedApps in SELECTED_APPS mode fails closed on connectNow
+        controller.setRoutingMode(RoutingMode.SELECTED_APPS)
+        controller.setSelectedApps(emptySet())
+        val emptyConnect = controller.connectNow()
+        assertTrue(emptyConnect.isFailure)
+        assertEquals("Error", controller.statusSnapshot().vpnState)
+        assertTrue(controller.statusSnapshot().errorMessage!!.contains("Select at least one app"))
+        assertNull(backend.lastConnectedConfig)
+
+        // 2. Valid installed app in SELECTED_APPS mode connects with IncludedApplications
+        controller.setSelectedApps(setOf("com.example.allowed"))
+        val validConnect = controller.connectNow()
+        assertTrue(validConnect.isSuccess)
+        assertEquals("Connected", controller.statusSnapshot().vpnState)
+        assertTrue(backend.lastConnectedConfig!!.contains("IncludedApplications = com.example.allowed"))
+
+        // 3. Subset of installed + uninstalled apps includes only installed apps on applyRoutingChangesNow
+        controller.setSelectedApps(setOf("com.example.allowed", "com.example.uninstalled"))
+        assertTrue(controller.statusSnapshot().reconnectRequired)
+        val subsetReconnect = controller.applyRoutingChangesNow()
+        assertTrue(subsetReconnect.isSuccess)
+        assertFalse(controller.statusSnapshot().reconnectRequired)
+        assertTrue(backend.lastConnectedConfig!!.contains("IncludedApplications = com.example.allowed"))
+        assertFalse(backend.lastConnectedConfig!!.contains("com.example.uninstalled"))
+
+        // 4. Only uninstalled apps selected -> applyRoutingChangesNow fails closed (never falls back to ALL_APPS)
+        backend.lastConnectedConfig = null
+        controller.setSelectedApps(setOf("com.example.uninstalled"))
+        val uninstalledReconnect = controller.applyRoutingChangesNow()
+        assertTrue(uninstalledReconnect.isFailure)
+        assertEquals("Error", controller.statusSnapshot().vpnState)
+        assertTrue(controller.statusSnapshot().errorMessage!!.contains("None of the selected apps are currently installed"))
+        assertNull(backend.lastConnectedConfig)
+
+        // 5. Reconnect error when backend.connect throws during applyRoutingChangesNow
+        controller.setSelectedApps(setOf("com.example.allowed"))
+        assertTrue(controller.connectNow().isSuccess)
+        controller.setSelectedApps(setOf("com.example.second"))
+        backend.failOnConnect = IllegalStateException("Kernel tunnel creation failed")
+        val failedReconnect = controller.applyRoutingChangesNow()
+        assertTrue(failedReconnect.isFailure)
+        assertEquals("Error", controller.statusSnapshot().vpnState)
+        assertTrue(controller.statusSnapshot().errorMessage!!.contains("Kernel tunnel creation failed"))
+
+        // 6. Reconnect error when backend.disconnect fails during applyRoutingChangesNow
+        backend.failOnConnect = null
+        assertTrue(controller.connectNow().isSuccess)
+        controller.setRoutingMode(RoutingMode.ALL_APPS)
+        backend.failOnDisconnect = IllegalStateException("Backend failed to bring tunnel down")
+        val failedDisconnect = controller.applyRoutingChangesNow()
+        assertTrue(failedDisconnect.isFailure)
+        assertEquals("Error", controller.statusSnapshot().vpnState)
+        assertTrue(controller.statusSnapshot().errorMessage!!.contains("Backend failed to bring tunnel down"))
+    }
+
+    @Test
+    fun keyRotation_recoversFromPostCommitTimeoutConflictAndLocalFailureWithoutLeakingPrivateKey() = runBlocking {
+        val controller = createController()
+        assertTrue(controller.provisionNow().isSuccess)
+
+        val initialPrivateKey = identityStore.loadPrivateKey()!!
+        val initialConfig = configStore.load()!!
+
+        // 1. Server commits new public key, but response times out before reaching Android
+        var serverCommittedOnFirstRotate = false
+        controlPlane.rotateBehavior = { deviceId, pubKey, _, _ ->
+            controlPlane.serverRegisteredKey = pubKey
+            serverCommittedOnFirstRotate = true
+            throw SocketTimeoutException("Read timed out after server updated peer")
+        }
+
+        val timedOutRotate = controller.rotateDeviceKeyNow()
+        assertTrue(timedOutRotate.isFailure)
+        assertTrue(serverCommittedOnFirstRotate)
+        // Working local config and active privateKey are preserved while pendingPrivateKey holds the new key
+        assertEquals(initialPrivateKey, identityStore.loadPrivateKey())
+        assertEquals(initialConfig, configStore.load())
+        val pendingAfterTimeout = identityStore.loadPendingPrivateKey()
+        assertNotNull(pendingAfterTimeout)
+        assertNotEquals(initialPrivateKey, pendingAfterTimeout)
+        assertEquals("Provisioned", controller.statusSnapshot().provisioningStatus)
+        assertEquals("10.67.0.2/32", controller.statusSnapshot().clientAddress)
+
+        // 2. Retry rotateDeviceKeyNow() -> reuses pendingPrivateKey, succeeds idempotently on server
+        controlPlane.resetDefaultBehaviors()
+        val retryRotate = controller.rotateDeviceKeyNow()
+        assertTrue(retryRotate.isSuccess)
+        assertEquals(pendingAfterTimeout, identityStore.loadPrivateKey())
+        assertNull(identityStore.loadPendingPrivateKey())
+        assertTrue(configStore.load()!!.contains(pendingAfterTimeout!!))
+        assertNull(controller.statusSnapshot().errorMessage)
+
+        // 3. HTTP 409 key conflict during rotation clears pendingPrivateKey and preserves working config
+        val keyBeforeConflict = identityStore.loadPrivateKey()!!
+        val configBeforeConflict = configStore.load()!!
+        controlPlane.rotateBehavior = { _, _, _, _ ->
+            throw ControlPlaneHttpException(409, "client_public_key is already registered to another device_id")
+        }
+        val conflictRotate = controller.rotateDeviceKeyNow()
+        assertTrue(conflictRotate.isFailure)
+        assertNull(identityStore.loadPendingPrivateKey())
+        assertEquals(keyBeforeConflict, identityStore.loadPrivateKey())
+        assertEquals(configBeforeConflict, configStore.load())
+        assertEquals("Provisioned", controller.statusSnapshot().provisioningStatus)
+
+        // 4. Local config save failure rolls back server peer to old public key and keeps old private key
+        controlPlane.resetDefaultBehaviors()
+        val oldPubKey = TunnelPilotKeyGenerator.generatePublicKey(
+            com.wireguard.crypto.Key.fromBase64(keyBeforeConflict),
+        ).toBase64()
+        configStore.failOnSave = IllegalStateException("Keystore write failure")
+        val localFailRotate = controller.rotateDeviceKeyNow()
+        assertTrue(localFailRotate.isFailure)
+        assertEquals(keyBeforeConflict, identityStore.loadPrivateKey())
+        assertEquals(oldPubKey, controlPlane.serverRegisteredKey)
+        configStore.failOnSave = null
+
+        // 5. Verify no private key was ever sent to Control Plane
+        assertFalse(controlPlane.observedPublicKeys.contains(initialPrivateKey))
+        assertFalse(controlPlane.observedPublicKeys.contains(pendingAfterTimeout))
+        assertFalse(controlPlane.observedPublicKeys.contains(keyBeforeConflict))
+    }
+
+    private class FakeTunnelBackend : TunnelBackend {
+        private var state: Tunnel.State = Tunnel.State.DOWN
+        var lastConnectedConfig: String? = null
+        var failOnConnect: Exception? = null
+        var failOnDisconnect: Exception? = null
+
+        override fun connect(configText: String) {
+            failOnConnect?.let { throw it }
+            lastConnectedConfig = configText
+            state = Tunnel.State.UP
+        }
+
+        override fun disconnect() {
+            failOnDisconnect?.let { throw it }
+            state = Tunnel.State.DOWN
+        }
+
+        override fun currentState(): Tunnel.State = state
+
+        override fun statistics(): Statistics? = null
+    }
+
+    private class FakeConfigStorage : ConfigStorage {
+        private var saved: String? = null
+        var failOnSave: Exception? = null
+
+        override fun save(config: String) {
+            failOnSave?.let { throw it }
+            saved = config
+        }
+
+        override fun load(): String? = saved
+
+        override fun clear() {
+            saved = null
+        }
+    }
+
+    private class FakeSettingsStorage : SettingsStorage {
+        private var mode: RoutingMode = RoutingMode.ALL_APPS
+        private var apps: Set<String> = emptySet()
+        private var url: String = "http://127.0.0.1:8000"
+
+        override fun getRoutingMode(): RoutingMode = mode
+        override fun setRoutingMode(mode: RoutingMode) {
+            this.mode = mode
+        }
+
+        override fun getSelectedApps(): Set<String> = apps
+        override fun setSelectedApps(packages: Set<String>) {
+            this.apps = packages
+        }
+
+        override fun getControlPlaneUrl(): String = url
+        override fun setControlPlaneUrl(url: String) {
+            this.url = url
+        }
+    }
+
+    private class FakeIdentityStorage : IdentityStorage {
+        private var deviceId: String = "device-test-1234"
+        private var privateKey: String? = null
+        private var pendingPrivateKey: String? = null
+        private var deviceToken: String? = null
+
+        override fun getOrCreateDeviceId(): String = deviceId
+        override fun loadPrivateKey(): String? = privateKey
+        override fun savePrivateKey(privateKey: String) {
+            this.privateKey = privateKey
+        }
+
+        override fun clearPrivateKey() {
+            privateKey = null
+            pendingPrivateKey = null
+        }
+
+        override fun loadPendingPrivateKey(): String? = pendingPrivateKey
+        override fun savePendingPrivateKey(privateKey: String) {
+            this.pendingPrivateKey = privateKey
+        }
+
+        override fun clearPendingPrivateKey() {
+            pendingPrivateKey = null
+        }
+
+        override fun loadDeviceToken(): String? = deviceToken
+        override fun saveDeviceToken(token: String) {
+            this.deviceToken = token
+        }
+
+        override fun clearDeviceToken() {
+            deviceToken = null
+        }
+
+        override fun resetIdentity(): String {
+            deviceId = "device-${UUID.randomUUID()}"
+            privateKey = null
+            pendingPrivateKey = null
+            deviceToken = null
+            return deviceId
+        }
+    }
+
+    private class FakeInstalledAppsProvider(
+        private val apps: List<InstalledApp>,
+    ) : InstalledAppsProvider {
+        override fun getLaunchableApps(): List<InstalledApp> = apps
+    }
+
+    private class FakeControlPlaneApi(
+        private val server: RegisteredServer,
+    ) : ControlPlaneApi {
+        var serverRegisteredKey: String? = null
+        val observedPublicKeys = mutableListOf<String>()
+
+        var registerBehavior: ((String, String, String, String?) -> RegistrationResult)? = null
+        var rotateBehavior: ((String, String, String, String) -> RotationResult)? = null
+
+        fun resetDefaultBehaviors() {
+            registerBehavior = null
+            rotateBehavior = null
+        }
+
+        override fun registerDevice(
+            deviceId: String,
+            publicKey: String,
+            appVersion: String,
+            deviceToken: String?,
+        ): RegistrationResult {
+            observedPublicKeys.add(publicKey)
+            registerBehavior?.let { return it(deviceId, publicKey, appVersion, deviceToken) }
+            if (serverRegisteredKey != null && serverRegisteredKey != publicKey) {
+                throw ControlPlaneHttpException(409, "device_id is already registered with a different public key")
+            }
+            serverRegisteredKey = publicKey
+            return RegistrationResult(
+                deviceId = deviceId,
+                clientAddress = "10.67.0.2/32",
+                provisioned = true,
+                server = server,
+                deviceToken = deviceToken ?: "issued-device-token-123",
+            )
+        }
+
+        override fun rotateDevice(
+            deviceId: String,
+            publicKey: String,
+            appVersion: String,
+            deviceToken: String,
+        ): RotationResult {
+            observedPublicKeys.add(publicKey)
+            rotateBehavior?.let { return it(deviceId, publicKey, appVersion, deviceToken) }
+            val status = if (serverRegisteredKey == publicKey) "unchanged" else "rotated"
+            serverRegisteredKey = publicKey
+            return RotationResult(
+                status = status,
+                deviceId = deviceId,
+                clientAddress = "10.67.0.2/32",
+                provisioned = true,
+                server = server,
+            )
+        }
+
+        override fun revokeDevice(deviceId: String, deviceToken: String): Boolean = true
+
+        override fun listServers(): List<RegisteredServer> = listOf(server)
+    }
+}
