@@ -19,9 +19,9 @@ else
   printf '%s\n' "$TOKEN" > "$TOKEN_FILE"
 fi
 chmod 600 "$TOKEN_FILE"
-if sudo test -f /etc/wireguard/tunnelpilot0-server_public.key; then
-  sudo cat /etc/wireguard/tunnelpilot0-server_public.key > "$REPO_ROOT/server/data/gateway-public.key"
-  chmod 600 "$REPO_ROOT/server/data/gateway-public.key"
+if [[ ! -s "$REPO_ROOT/server/data/gateway-public.key" ]] && sudo -n test -f /etc/wireguard/tunnelpilot0-server_public.key 2>/dev/null; then
+  sudo -n cat /etc/wireguard/tunnelpilot0-server_public.key > "$REPO_ROOT/server/data/gateway-public.key" 2>/dev/null || true
+  chmod 600 "$REPO_ROOT/server/data/gateway-public.key" 2>/dev/null || true
 fi
 
 TARGET_UID="$(id -u)"
