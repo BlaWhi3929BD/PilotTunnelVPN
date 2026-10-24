@@ -44,6 +44,8 @@ import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
 import com.blawhi3929bd.tunnelpilot.provisioning.RegisteredServer
+import com.blawhi3929bd.tunnelpilot.ui.AdContainer
+import com.blawhi3929bd.tunnelpilot.ui.ConsentDialog
 import java.util.Locale
 
 class MainActivity : ComponentActivity() {
@@ -126,6 +128,8 @@ private fun TunnelPilotScreen(
     val assignedServerId by viewModel.assignedServerId.collectAsState()
     val deviceTier by viewModel.deviceTier.collectAsState()
     val adsConsent by viewModel.adsConsent.collectAsState()
+    val adsConsentAnswered by viewModel.adsConsentAnswered.collectAsState()
+    val premiumExpiresAt by viewModel.premiumExpiresAt.collectAsState()
     val provisioningState by viewModel.provisioningState.collectAsState()
     val servers by viewModel.servers.collectAsState()
     val serversLoaded by viewModel.serversLoaded.collectAsState()
@@ -133,6 +137,21 @@ private fun TunnelPilotScreen(
     val serversError by viewModel.serversError.collectAsState()
     val vpnPermissionRequired by viewModel.vpnPermissionRequired.collectAsState()
     val hasDeviceToken by viewModel.hasDeviceToken.collectAsState()
+
+    var showConsentDialog by remember { mutableStateOf(false) }
+
+    if (!adsConsentAnswered || showConsentDialog) {
+        ConsentDialog(
+            onConsentChoice = {
+                viewModel.setAdsConsent(it)
+                showConsentDialog = false
+            },
+            onOpenPrivacyPolicy = {
+                section = "Setup"
+                showConsentDialog = false
+            },
+        )
+    }
 
     Column(Modifier.fillMaxSize().padding(20.dp)) {
         Text("TunnelPilot", style = MaterialTheme.typography.headlineMedium)
@@ -158,6 +177,7 @@ private fun TunnelPilotScreen(
                 assignedServerId = assignedServerId,
                 deviceTier = deviceTier,
                 adsConsent = adsConsent,
+                premiumExpiresAt = premiumExpiresAt,
                 vpnPermissionRequired = vpnPermissionRequired,
                 routingMode = routingMode,
                 selectedCount = selectedApps.size,
@@ -168,6 +188,7 @@ private fun TunnelPilotScreen(
                 onApplyRouting = viewModel::applyRoutingChanges,
                 onRoutingMode = viewModel::setRoutingMode,
                 onAdsConsent = viewModel::setAdsConsent,
+                onRewardPremium = { viewModel.rewardPremiumAccess(24) },
                 onUpgradeTier = { viewModel.upgradeTier("premium", "play-billing-verified-token") },
                 onOpenSetup = { section = "Setup" },
                 onOpenConfig = { section = "Config" },
@@ -210,6 +231,7 @@ private fun TunnelPilotScreen(
                 onRefreshServers = viewModel::refreshServers,
                 onResetIdentity = { viewModel.resetIdentity(forceLocal = false) },
                 onForceResetLocalIdentity = { viewModel.resetIdentity(forceLocal = true) },
+                onReviewPrivacyChoices = { showConsentDialog = true },
             )
         }
     }
@@ -223,6 +245,7 @@ private fun VpnSection(
     assignedServerId: String?,
     deviceTier: String,
     adsConsent: Boolean,
+    premiumExpiresAt: Long = 0L,
     vpnPermissionRequired: Boolean,
     routingMode: RoutingMode,
     selectedCount: Int,
@@ -233,6 +256,7 @@ private fun VpnSection(
     onApplyRouting: () -> Unit,
     onRoutingMode: (RoutingMode) -> Unit,
     onAdsConsent: (Boolean) -> Unit,
+    onRewardPremium: () -> Unit = {},
     onUpgradeTier: () -> Unit,
     onOpenSetup: () -> Unit,
     onOpenConfig: () -> Unit,
@@ -368,44 +392,52 @@ private fun VpnSection(
         }
 
         Spacer(Modifier.height(12.dp))
-        Card(Modifier.fillMaxWidth()) {
-            Column(Modifier.padding(16.dp)) {
-                if (deviceTier == "premium") {
+        if (deviceTier == "premium") {
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
                     Text("TunnelPilot Premium Active", style = MaterialTheme.typography.titleSmall)
                     Spacer(Modifier.height(4.dp))
+                    val hoursRemaining = if (premiumExpiresAt > 0L) {
+                        val diff = premiumExpiresAt - System.currentTimeMillis()
+                        val hours = (diff / (3600 * 1000L)).coerceAtLeast(0)
+                        val mins = ((diff % (3600 * 1000L)) / (60 * 1000L)).coerceAtLeast(0)
+                        " (Reward expires in ${hours}h ${mins}m)"
+                    } else ""
                     Text(
-                        "Ad-free experience and access to all Premium regional gateways enabled.",
+                        "Ad-free experience and access to all Premium regional gateways enabled$hoursRemaining.",
                         style = MaterialTheme.typography.bodySmall,
                     )
-                } else {
-                    Text("Free Plan (In-App Sponsor Supported)", style = MaterialTheme.typography.titleSmall)
+                }
+            }
+        } else {
+            AdContainer(
+                deviceTier = deviceTier,
+                adsConsent = adsConsent,
+                onWatchRewarded = onRewardPremium,
+            )
+            Spacer(Modifier.height(8.dp))
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Free Plan Options", style = MaterialTheme.typography.titleSmall)
                     Spacer(Modifier.height(4.dp))
-                    Text(
-                        "TunnelPilot never modifies or injects ads into your VPN network traffic. " +
-                            "Optional in-app sponsor card is shown only inside this screen.",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    Spacer(Modifier.height(8.dp))
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
                         Checkbox(checked = adsConsent, onCheckedChange = onAdsConsent)
                         Text(
-                            "Allow non-personalized in-app sponsor banner",
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                    if (adsConsent) {
-                        Spacer(Modifier.height(4.dp))
-                        Text(
-                            "[Sponsor] Upgrade to TunnelPilot Premium for high-capacity gateways and zero banners.",
+                            "Allow personalized in-app sponsor recommendations",
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
                     Spacer(Modifier.height(8.dp))
-                    OutlinedButton(onClick = onUpgradeTier) {
-                        Text("Upgrade to Premium (Ad-Free)")
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        OutlinedButton(onClick = onRewardPremium, modifier = Modifier.weight(1f)) {
+                            Text("✨ Watch Ad (24h)")
+                        }
+                        OutlinedButton(onClick = onUpgradeTier, modifier = Modifier.weight(1f)) {
+                            Text("Upgrade Plan")
+                        }
                     }
                 }
             }
@@ -536,6 +568,7 @@ private fun SetupSection(
     onRefreshServers: () -> Unit,
     onResetIdentity: () -> Unit,
     onForceResetLocalIdentity: () -> Unit,
+    onReviewPrivacyChoices: () -> Unit = {},
 ) {
     val isBusy = provisioningState is ProvisioningState.Provisioning
     val isProvisioned = provisioningState is ProvisioningState.Provisioned && hasDeviceToken
@@ -751,6 +784,25 @@ private fun SetupSection(
         } else if (serversLoaded && !serversLoading) {
             Spacer(Modifier.height(8.dp))
             Text("No enabled VPN servers reported by control plane.")
+        }
+
+        Spacer(Modifier.height(16.dp))
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp)) {
+                Text("Privacy & Advertising Choice", style = MaterialTheme.typography.titleMedium)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "TunnelPilot operates on a strict Zero-Log policy. Network traffic inside the VPN tunnel is never inspected, recorded, or shared with advertisers.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedButton(
+                    onClick = onReviewPrivacyChoices,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text("Review Privacy & Ad Choices")
+                }
+            }
         }
     }
 }

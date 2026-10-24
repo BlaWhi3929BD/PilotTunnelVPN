@@ -23,6 +23,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val assignedServerId: StateFlow<String?> = controller.assignedServerId
     val deviceTier: StateFlow<String> = controller.deviceTier
     val adsConsent: StateFlow<Boolean> = controller.adsConsent
+    val adsConsentAnswered: StateFlow<Boolean> = controller.adsConsentAnswered
+    val premiumExpiresAt: StateFlow<Long> = controller.premiumExpiresAt
     val provisioningState: StateFlow<ProvisioningState> = controller.provisioningState
     val servers: StateFlow<List<RegisteredServer>> = controller.servers
     val serversLoaded: StateFlow<Boolean> = controller.serversLoaded
@@ -60,6 +62,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun migrateServer(targetServerId: String) = controller.migrateServer(targetServerId)
 
     fun upgradeTier(tier: String, purchaseToken: String? = null) = controller.upgradeTier(tier, purchaseToken)
+
+    fun rewardPremiumAccess(durationHours: Int = 24) = controller.rewardPremiumAccess(durationHours)
 
     fun refreshServers() = controller.refreshServers()
 

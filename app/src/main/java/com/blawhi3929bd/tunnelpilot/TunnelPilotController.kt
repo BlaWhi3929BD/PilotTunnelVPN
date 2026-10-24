@@ -54,6 +54,9 @@ data class ControllerStatusSnapshot(
     val preferredServerId: String? = null,
     val preferredRegion: String? = null,
     val deviceTier: String = "free",
+    val adsConsent: Boolean = false,
+    val adsConsentAnswered: Boolean = false,
+    val premiumExpiresAt: Long = 0L,
 )
 
 class TunnelPilotController internal constructor(
@@ -117,6 +120,12 @@ class TunnelPilotController internal constructor(
 
     private val _adsConsent = MutableStateFlow(settingsStore.getAdsConsent())
     val adsConsent: StateFlow<Boolean> = _adsConsent.asStateFlow()
+
+    private val _adsConsentAnswered = MutableStateFlow(settingsStore.hasAnsweredConsent())
+    val adsConsentAnswered: StateFlow<Boolean> = _adsConsentAnswered.asStateFlow()
+
+    private val _premiumExpiresAt = MutableStateFlow(settingsStore.getPremiumExpiresAt())
+    val premiumExpiresAt: StateFlow<Long> = _premiumExpiresAt.asStateFlow()
 
     private val _provisioningState = MutableStateFlow(loadPersistedProvisioningState())
     val provisioningState: StateFlow<ProvisioningState> = _provisioningState.asStateFlow()
@@ -260,8 +269,31 @@ class TunnelPilotController internal constructor(
     }
 
     fun setAdsConsent(consented: Boolean) {
-        _adsConsent.value = consented
         settingsStore.setAdsConsent(consented)
+        settingsStore.setHasAnsweredConsent(true)
+        _adsConsent.value = consented
+        _adsConsentAnswered.value = true
+    }
+
+    fun rewardPremiumAccess(durationHours: Int = 24) {
+        val now = System.currentTimeMillis()
+        val expiresAt = now + (durationHours.coerceAtLeast(1) * 3600 * 1000L)
+        settingsStore.setPremiumExpiresAt(expiresAt)
+        settingsStore.setDeviceTier("premium")
+        _premiumExpiresAt.value = expiresAt
+        _deviceTier.value = "premium"
+    }
+
+    fun checkPremiumExpiry(): Boolean {
+        val expires = settingsStore.getPremiumExpiresAt()
+        if (expires > 0L && System.currentTimeMillis() > expires && settingsStore.getDeviceTier() == "premium") {
+            settingsStore.setDeviceTier("free")
+            settingsStore.setPremiumExpiresAt(0L)
+            _deviceTier.value = "free"
+            _premiumExpiresAt.value = 0L
+            return true
+        }
+        return false
     }
 
     fun refreshServers() {
@@ -800,6 +832,7 @@ class TunnelPilotController internal constructor(
             is ProvisioningState.Error -> Triple("Error", extractClientAddress(configStore.load()), currentProv.message)
         }
         val currentAssigned = (currentProv as? ProvisioningState.Provisioned)?.serverId ?: _assignedServerId.value
+        checkPremiumExpiry()
         return ControllerStatusSnapshot(
             vpnState = vpnLabel,
             rxBytes = rx,
@@ -819,6 +852,9 @@ class TunnelPilotController internal constructor(
             preferredServerId = _preferredServerId.value,
             preferredRegion = _preferredRegion.value,
             deviceTier = _deviceTier.value,
+            adsConsent = _adsConsent.value,
+            adsConsentAnswered = _adsConsentAnswered.value,
+            premiumExpiresAt = _premiumExpiresAt.value,
         )
     }
 

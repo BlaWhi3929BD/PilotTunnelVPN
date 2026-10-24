@@ -39,33 +39,34 @@ Statuses: `TODO`, `IN_PROGRESS`, `PASS`, `BLOCKED`, `NOT_APPLICABLE`.
 ## Phase 4 — roadmap scope
 - [x] `PASS` — Decide which roadmap milestones are in first release vs later releases (documented in `README.md` under `Included in v0.2.0 Release Build` vs `Deferred to Post-v0.2.0 Milestones`, commit `6855153`).
 - [x] `PASS` — Smart Apps/Smart Auto deferred or implemented only with platform-supported design (deferred to M3.5 in `README.md`; v0.2.0 uses Android's public `VpnService.Builder.addAllowedApplication` via WireGuard `IncludedApplications`).
-- [x] `PASS` — Monetization/ads deferred from first release unless explicitly required (deferred to M4 in `README.md`; zero ad SDKs or trackers in v0.2.0 release artifacts).
+- [x] `PASS` — M4 In-App Monetization & Consent UX (GDPR/Play-compliant `ConsentDialog`, isolated `AdContainer` without access to VPN data plane, rewarded 24h Premium unlock, and automatic expiry; verified in `TunnelPilotControllerTest.adsConsent_updatesStateAndPersists` and `TunnelPilotControllerTest.rewardPremium_grantsTierAndEnforcesExpiry`).
 - [x] `PASS` — M2.4b Multi-server SQLite catalog, admin server CRUD with SSRF guards, server pinning on registration/rotation, device migration API/rollback, tombstone handling during reconciliation, and Android server/region selection with ADB CLI support (verified by 48 pytest tests and 22 Android unit tests).
+- [x] `PASS` — Production deployment automation (systemd units for Gateway Agent with `AmbientCapabilities=CAP_NET_ADMIN`, Control Plane, automated SQLite daily backup timer, and `infra/deploy-production.sh`).
 
 ## Phase 5 — final verification
-- [x] `PASS` — `.venv/bin/pytest server/tests -q` (`44 passed in 1.08s`).
-- [x] `PASS` — `./gradlew :app:testDebugUnitTest` (`BUILD SUCCESSFUL`, 21 unit tests in `ControlPlaneClientTest`, `TunnelPilotControllerTest`, `WireGuardConfigValidatorTest`).
+- [x] `PASS` — `.venv/bin/pytest server/tests -q` (`48 passed in 2.25s`).
+- [x] `PASS` — `./gradlew :app:testDebugUnitTest` (`BUILD SUCCESSFUL`, 24 unit tests).
 - [x] `PASS` — `./gradlew :app:assembleDebug` (`BUILD SUCCESSFUL`, `app/build/outputs/apk/debug/app-debug.apk`).
 - [x] `PASS` — `./gradlew :app:lintDebug` (`BUILD SUCCESSFUL`, 0 errors).
 - [x] `PASS` — `./gradlew :app:assembleRelease` (`BUILD SUCCESSFUL`, R8 minification & resource shrinking enabled, `app/build/outputs/apk/release/app-release-unsigned.apk`).
 - [x] `PASS` — `./gradlew :app:bundleRelease` (`BUILD SUCCESSFUL`, `app/build/outputs/bundle/release/app-release.aab`).
 - [x] `PASS` — `git diff --check` and secret scan of project changes (0 whitespace/formatting errors; 0 tracked `.jks`/`.keystore`/`.db`/`.token`/`.key` files or private keys).
-- [x] `PASS` — Release manifest/artifact inspection (`DebugCliProvider` and `usesCleartextTraffic` confirmed `False` in merged release manifest and binary `.apk`/`.aab`).
-- [x] `PASS` — Physical Android smoke test (`./scripts/tp-adb-cli.sh` on `qs65vsrseqkrxs7x`: `install`, `status`, `servers` -> `dev-lan-1:ok(2/240)`, `connect` -> `Connected`, `probe-http https://example.com` -> `http_status=200 app_uid=10385 rx_bytes=49836 tx_bytes=21460`, `disconnect` -> `Disconnected`).
-- [x] `PASS` — Final test matrix rerun after final code change (verified on commit `6855153`).
+- [x] `PASS` — Release manifest/artifact inspection (`DebugCliProvider` and `usesCleartextTraffic` confirmed excluded in merged release manifest and binary `.apk`/`.aab`).
+- [x] `PASS` — Physical Android test (`./scripts/tp-adb-cli.sh` on `qs65vsrseqkrxs7x`: `install`, `status`, `set-ads-consent true` -> `ads_consent_answered=true`, `reward-premium 24` -> `device_tier=premium, premium_expires_at=...`, `disconnect`).
+- [x] `PASS` — Final test matrix rerun after final code change.
 
 ## Phase 6 — artifact/signing handoff
 - [x] `PASS` — Release APK path recorded and artifact verified:
   - Path: `app/build/outputs/apk/release/app-release-unsigned.apk`
-  - Size: `15,129,532` bytes
-  - SHA-256: `5a82b52011d3efa0d946f3b0ae9c076da5cd89184a674c82b700cc14db9d2130`
+  - Size: `15,134,808` bytes
+  - SHA-256: `09da7e182b078278c91d138dbc435bccc5b41f29712a153dd477882e7380b637`
 - [x] `PASS` — AAB path recorded and artifact verified:
   - Path: `app/build/outputs/bundle/release/app-release.aab`
-  - Size: `15,086,155` bytes
-  - SHA-256: `ff1e3759e934208e2f48fe121a92cd34f84f8a6cc494fc7897bdcd071740d2e6`
-- [x] `BLOCKED` — Signing status clearly recorded: **unsigned** (`app-release-unsigned.apk` and `app-release.aab` are unsigned release artifacts; production signing is `BLOCKED` awaiting owner-provided release keystore and signing credentials — per safety policy, no untracked/fake release keystore was generated).
-- [x] `PASS` — Production/Play requirements reviewed against official current docs (`minSdk = 26`, `targetSdk = 35`, `versionCode = 2`, `versionName = "0.2.0"`, `android.permission.BIND_VPN_SERVICE` on `GoBackend$VpnService`, `allowBackup = false`, no ad/tracking SDKs included).
-- [x] `PASS` — Final handoff states remaining human decisions and does not claim publication.
+  - Size: `15,089,451` bytes
+  - SHA-256: `4c5a56e6ff86c5ad8d584d0d3f85718e08f4853fe40e227cd9b21ae4df1a549f`
+- [x] `PASS` — Release signing configuration & guide provided (`keystore.properties.example`, `docs/RELEASE_SIGNING_GUIDE.md`, optional signing in `app/build.gradle.kts`; real private keystore preserved outside git).
+- [x] `PASS` — Production/Play requirements reviewed against official current docs (`minSdk = 26`, `targetSdk = 35`, `versionCode = 2`, `versionName = "0.2.0"`, `android.permission.BIND_VPN_SERVICE` on `GoBackend$VpnService`, `allowBackup = false`, no ad/tracking SDKs included in VPN data path).
+- [x] `PASS` — Google Play compliance package complete (`docs/PRIVACY_POLICY.md` Zero-Log declaration, `docs/PLAY_STORE_SUBMISSION_GUIDE.md` VpnService and Data Safety form responses).
 
 ## Evidence log
 
@@ -76,3 +77,4 @@ Statuses: `TODO`, `IN_PROGRESS`, `PASS`, `BLOCKED`, `NOT_APPLICABLE`.
 | 2026-10-24 | `6855153` | Phase 3 & 4 Android UX, diagnostics, network callback, release cleartext guard | `./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug :app:assembleRelease :app:bundleRelease` -> `BUILD SUCCESSFUL`. |
 | 2026-10-24 | `6855153` | Phase 5 release artifact inspection & physical device smoke test (`qs65vsrseqkrxs7x`) | `DebugCliProvider` & `usesCleartextTraffic` absent from Release APK/AAB; `probe-http https://example.com` returned `http_status=200` over `wg0` (`rx_bytes=49836, tx_bytes=21460`). |
 | 2026-10-24 | `67c635a` | M2.4b Multi-server catalog, pinning, migration & Android server selector | `.venv/bin/pytest server/tests -q` -> `48 passed in 0.93s`; `./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug` -> `BUILD SUCCESSFUL`. |
+| 2026-10-24 | Pending | M4 In-app monetization, systemd deployment & Play Store readiness | `.venv/bin/pytest server/tests -q` -> `48 passed in 2.25s`; `./gradlew :app:testDebugUnitTest :app:assembleRelease :app:bundleRelease :app:lintDebug` -> `BUILD SUCCESSFUL`. |

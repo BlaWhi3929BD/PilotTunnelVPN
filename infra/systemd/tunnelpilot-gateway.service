@@ -1,0 +1,38 @@
+[Unit]
+Description=TunnelPilot WireGuard Gateway Agent
+After=network.target network-online.target systemd-sysctl.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tunnelpilot
+Group=tunnelpilot
+WorkingDirectory=/opt/tunnelpilot
+
+# Least privilege: grant only CAP_NET_ADMIN to configure WireGuard interface
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=true
+
+# Security sandboxing
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+ReadWritePaths=/opt/tunnelpilot/server/data
+
+# Environment configuration
+EnvironmentFile=-/etc/tunnelpilot/gateway.env
+Environment=TUNNELPILOT_WG_INTERFACE=tunnelpilot0
+Environment=TUNNELPILOT_WG_MAX_PEERS=240
+
+ExecStart=/opt/tunnelpilot/.venv/bin/uvicorn server.gateway_agent.app:app --host 127.0.0.1 --port 8787
+
+Restart=always
+RestartSec=3
+KillMode=mixed
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

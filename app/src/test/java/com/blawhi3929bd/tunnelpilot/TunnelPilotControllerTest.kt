@@ -435,6 +435,36 @@ class TunnelPilotControllerTest {
         assertTrue(configStore.load()!!.contains(targetServerPublicKey))
     }
 
+    @Test
+    fun adsConsent_updatesStateAndPersists() = runBlocking {
+        val controller = createController()
+        assertFalse(controller.adsConsent.value)
+        assertFalse(controller.adsConsentAnswered.value)
+
+        controller.setAdsConsent(true)
+        assertTrue(controller.adsConsent.value)
+        assertTrue(controller.adsConsentAnswered.value)
+        assertTrue(controller.statusSnapshot().adsConsent)
+        assertTrue(controller.statusSnapshot().adsConsentAnswered)
+    }
+
+    @Test
+    fun rewardPremium_grantsTierAndEnforcesExpiry() = runBlocking {
+        val controller = createController()
+        assertEquals("free", controller.deviceTier.value)
+
+        controller.rewardPremiumAccess(durationHours = 24)
+        assertEquals("premium", controller.deviceTier.value)
+        assertTrue(controller.premiumExpiresAt.value > System.currentTimeMillis())
+        assertEquals("premium", controller.statusSnapshot().deviceTier)
+
+        // Simulate expired timestamp
+        settingsStore.setPremiumExpiresAt(System.currentTimeMillis() - 1000L)
+        assertTrue(controller.checkPremiumExpiry())
+        assertEquals("free", controller.deviceTier.value)
+        assertEquals("free", controller.statusSnapshot().deviceTier)
+    }
+
     private class FakeTunnelBackend : TunnelBackend {
         private var state: Tunnel.State = Tunnel.State.DOWN
         var lastConnectedConfig: String? = null
@@ -482,6 +512,8 @@ class TunnelPilotControllerTest {
         private var assignedServerId: String? = null
         private var deviceTier: String = "free"
         private var adsConsent: Boolean = false
+        private var consentAnswered: Boolean = false
+        private var premiumExpiresAt: Long = 0L
 
         override fun getRoutingMode(): RoutingMode = mode
         override fun setRoutingMode(mode: RoutingMode) {
@@ -521,6 +553,16 @@ class TunnelPilotControllerTest {
         override fun getAdsConsent(): Boolean = adsConsent
         override fun setAdsConsent(consented: Boolean) {
             this.adsConsent = consented
+        }
+
+        override fun hasAnsweredConsent(): Boolean = consentAnswered
+        override fun setHasAnsweredConsent(answered: Boolean) {
+            this.consentAnswered = answered
+        }
+
+        override fun getPremiumExpiresAt(): Long = premiumExpiresAt
+        override fun setPremiumExpiresAt(timestampMs: Long) {
+            this.premiumExpiresAt = timestampMs
         }
     }
 

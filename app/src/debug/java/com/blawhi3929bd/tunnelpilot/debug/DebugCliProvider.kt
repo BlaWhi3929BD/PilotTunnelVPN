@@ -105,6 +105,16 @@ class DebugCliProvider : ContentProvider() {
                         "reset_identity new_device_id=$newId"
                     }
                 }
+                "set_ads_consent" -> runCatching {
+                    val consent = arg?.trim()?.equals("true", ignoreCase = true) == true
+                    controller.setAdsConsent(consent)
+                    "ads_consent=$consent"
+                }
+                "reward_premium" -> runCatching {
+                    val hours = arg?.trim()?.toIntOrNull() ?: 24
+                    controller.rewardPremiumAccess(hours)
+                    "rewarded_premium hours=$hours"
+                }
                 "check_servers", "servers" -> {
                     controller.refreshServersNow().map { list ->
                         list.joinToString(";") { srv ->
@@ -156,6 +166,9 @@ class DebugCliProvider : ContentProvider() {
                 putString("device_tier", snapshot.deviceTier)
                 putBoolean("has_device_token", snapshot.hasDeviceToken)
                 putBoolean("vpn_permission_required", snapshot.vpnPermissionRequired)
+                putBoolean("ads_consent", snapshot.adsConsent)
+                putBoolean("ads_consent_answered", snapshot.adsConsentAnswered)
+                putLong("premium_expires_at", snapshot.premiumExpiresAt)
                 snapshot.errorMessage?.let { putString("error", it) }
             }
         }

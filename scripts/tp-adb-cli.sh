@@ -118,6 +118,12 @@ case "$cmd" in
   reset-identity|reset_identity)
     call_cli "reset_identity" "${1:-}"
     ;;
+  set-ads-consent|set_ads_consent)
+    call_cli "set_ads_consent" "${1:-true}"
+    ;;
+  reward-premium|reward_premium)
+    call_cli "reward_premium" "${1:-24}"
+    ;;
   help|-h|--help)
     cat <<EOF
 Usage: $0 <command> [arg]

@@ -21,6 +21,10 @@ interface SettingsStorage {
     fun setDeviceTier(tier: String) {}
     fun getAdsConsent(): Boolean = false
     fun setAdsConsent(consented: Boolean) {}
+    fun hasAnsweredConsent(): Boolean = false
+    fun setHasAnsweredConsent(answered: Boolean) {}
+    fun getPremiumExpiresAt(): Long = 0L
+    fun setPremiumExpiresAt(timestampMs: Long) {}
 }
 
 class AppSettingsStore(context: Context) : SettingsStorage {
@@ -92,6 +96,18 @@ class AppSettingsStore(context: Context) : SettingsStorage {
         prefs.edit { putBoolean(KEY_ADS_CONSENT, consented) }
     }
 
+    override fun hasAnsweredConsent(): Boolean = prefs.getBoolean(KEY_CONSENT_ANSWERED, false)
+
+    override fun setHasAnsweredConsent(answered: Boolean) {
+        prefs.edit { putBoolean(KEY_CONSENT_ANSWERED, answered) }
+    }
+
+    override fun getPremiumExpiresAt(): Long = prefs.getLong(KEY_PREMIUM_EXPIRES_AT, 0L)
+
+    override fun setPremiumExpiresAt(timestampMs: Long) {
+        prefs.edit { putLong(KEY_PREMIUM_EXPIRES_AT, timestampMs.coerceAtLeast(0L)) }
+    }
+
     private companion object {
         const val NAME = "tunnelpilot_settings"
         const val KEY_ROUTING_MODE = "routing_mode"
@@ -102,6 +118,8 @@ class AppSettingsStore(context: Context) : SettingsStorage {
         const val KEY_ASSIGNED_SERVER_ID = "assigned_server_id"
         const val KEY_DEVICE_TIER = "device_tier"
         const val KEY_ADS_CONSENT = "ads_consent"
+        const val KEY_CONSENT_ANSWERED = "consent_answered"
+        const val KEY_PREMIUM_EXPIRES_AT = "premium_expires_at"
         const val DEFAULT_CONTROL_PLANE_URL = "http://10.0.2.2:8000"
     }
 }

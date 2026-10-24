@@ -1,0 +1,13 @@
+[Unit]
+Description=TunnelPilot Daily SQLite Database Backup
+After=network.target
+
+[Service]
+Type=oneshot
+User=tunnelpilot
+Group=tunnelpilot
+WorkingDirectory=/opt/tunnelpilot
+ExecStart=/opt/tunnelpilot/infra/backup-database.sh
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/tunnelpilot/server/data
