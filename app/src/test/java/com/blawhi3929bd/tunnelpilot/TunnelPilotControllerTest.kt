@@ -465,6 +465,24 @@ class TunnelPilotControllerTest {
         assertEquals("free", controller.statusSnapshot().deviceTier)
     }
 
+    @Test
+    fun refreshState_and_init_automaticallyEnforcePremiumExpiry() = runBlocking {
+        val controller = createController()
+        controller.rewardPremiumAccess(durationHours = 24)
+        assertEquals("premium", controller.deviceTier.value)
+
+        // Set expired timestamp in store and trigger refreshState without explicit checkPremiumExpiry call
+        settingsStore.setPremiumExpiresAt(System.currentTimeMillis() - 5000L)
+        controller.refreshState()
+        assertEquals("free", controller.deviceTier.value)
+
+        // Re-grant and test that fresh controller init also checks and clears expired premium
+        settingsStore.setPremiumExpiresAt(System.currentTimeMillis() - 10000L)
+        val newController = createController()
+        assertEquals("free", newController.deviceTier.value)
+        assertEquals(0L, newController.premiumExpiresAt.value)
+    }
+
     private class FakeTunnelBackend : TunnelBackend {
         private var state: Tunnel.State = Tunnel.State.DOWN
         var lastConnectedConfig: String? = null

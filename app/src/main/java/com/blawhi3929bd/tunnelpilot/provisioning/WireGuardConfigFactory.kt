@@ -22,7 +22,7 @@ object WireGuardConfigFactory {
             appendLine("[Interface]")
             appendLine("PrivateKey = $privateKey")
             appendLine("Address = $clientAddress")
-            appendLine("DNS = 1.1.1.1")
+            appendLine("DNS = 1.1.1.1, 8.8.8.8")
             appendLine()
             appendLine("[Peer]")
             appendLine("PublicKey = ${server.publicKey}")

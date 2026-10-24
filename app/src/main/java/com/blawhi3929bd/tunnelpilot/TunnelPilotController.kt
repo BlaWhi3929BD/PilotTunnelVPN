@@ -151,6 +151,7 @@ class TunnelPilotController internal constructor(
     private var statsJob: Job? = null
 
     init {
+        checkPremiumExpiry()
         if (startBackgroundTasks) {
             refreshInstalledApps()
             scope.launch {
@@ -198,6 +199,7 @@ class TunnelPilotController internal constructor(
     }
 
     fun refreshState() {
+        checkPremiumExpiry()
         syncBackendState()
         _vpnPermissionRequired.value = vpnPermissionChecker() != null
         _hasDeviceToken.value = identityStore.loadDeviceToken() != null
@@ -286,7 +288,7 @@ class TunnelPilotController internal constructor(
 
     fun checkPremiumExpiry(): Boolean {
         val expires = settingsStore.getPremiumExpiresAt()
-        if (expires > 0L && System.currentTimeMillis() > expires && settingsStore.getDeviceTier() == "premium") {
+        if (expires > 0L && System.currentTimeMillis() > expires) {
             settingsStore.setDeviceTier("free")
             settingsStore.setPremiumExpiresAt(0L)
             _deviceTier.value = "free"
