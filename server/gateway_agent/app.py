@@ -10,7 +10,11 @@ from fastapi import FastAPI, Header, HTTPException, Query, status
 from .models import GatewayHealthResponse, PeerCreateRequest, PeerListResponse, PeerResponse
 from .wireguard import WireGuardController
 
-ENVIRONMENT = os.getenv("TUNNELPILOT_ENV", "development").strip().lower()
+ENVIRONMENT = (
+    os.getenv("TUNNELPILOT_ENV")
+    or os.getenv("TUNNELPILOT_ENVIRONMENT")
+    or "development"
+).strip().lower()
 GATEWAY_AGENT_TOKEN = os.getenv("TUNNELPILOT_GATEWAY_AGENT_TOKEN")
 WG_INTERFACE = os.getenv("TUNNELPILOT_WG_INTERFACE", "tunnelpilot0")
 WG_BINARY = os.getenv("TUNNELPILOT_WG_BINARY", "wg")

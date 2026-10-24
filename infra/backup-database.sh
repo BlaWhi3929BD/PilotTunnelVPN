@@ -5,6 +5,11 @@ DB_PATH="${TUNNELPILOT_DATABASE_PATH:-/opt/tunnelpilot/server/data/tunnelpilot.d
 BACKUP_DIR="${TUNNELPILOT_BACKUP_DIR:-/opt/tunnelpilot/server/data/backups}"
 MAX_BACKUPS="${TUNNELPILOT_MAX_BACKUPS:-7}"
 
+if ! command -v sqlite3 >/dev/null 2>&1; then
+  echo "Error: sqlite3 binary is required for database backup but was not found." >&2
+  exit 1
+fi
+
 if [[ ! -f "$DB_PATH" ]]; then
   echo "Database not found at $DB_PATH, skipping backup."
   exit 0

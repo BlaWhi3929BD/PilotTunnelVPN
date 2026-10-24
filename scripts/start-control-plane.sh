@@ -7,10 +7,8 @@ REPO_ROOT="$(pwd)"
 TOKEN_FILE="$REPO_ROOT/server/data/gateway-agent.token"
 if [[ -f "$TOKEN_FILE" ]]; then
   GATEWAY_TOKEN="$(cat "$TOKEN_FILE")"
-elif [[ -f /tmp/tunnelpilot-gateway-agent-token ]]; then
-  GATEWAY_TOKEN="$(sudo cat /tmp/tunnelpilot-gateway-agent-token)"
 else
-  echo "Error: gateway agent token not found. Start gateway agent first!" >&2
+  echo "Error: gateway agent token not found at $TOKEN_FILE. Start gateway agent first!" >&2
   exit 1
 fi
 PUBKEY_FILE="$REPO_ROOT/server/data/gateway-public.key"

@@ -20,6 +20,7 @@ ReadWritePaths=/opt/tunnelpilot/server/data
 
 # Environment configuration
 EnvironmentFile=-/etc/tunnelpilot/control-plane.env
+Environment=TUNNELPILOT_ENV=production
 Environment=TUNNELPILOT_ENVIRONMENT=production
 Environment=TUNNELPILOT_DATABASE_PATH=/opt/tunnelpilot/server/data/tunnelpilot.db
 

@@ -1,4 +1,5 @@
 import base64
+import os
 
 import pytest
 from fastapi.testclient import TestClient
@@ -18,6 +19,8 @@ def isolated_store(tmp_path, monkeypatch) -> None:
     store = DeviceStore(tmp_path / "devices.db")
     monkeypatch.setattr(main, "DEVICE_STORE", store)
     main.DEVICES.clear()
+    main._REGISTRATION_REQUEST_HISTORY.clear()
+    main._GATEWAY_HEALTH_CACHE.clear()
     main.CONTROL_PLANE_TOKEN = None
     main.GATEWAY_AGENT_URL = None
     main.GATEWAY_AGENT_TOKEN = None
@@ -972,6 +975,25 @@ def test_production_runtime_configuration_rejects_dangerous_defaults() -> None:
     main._validate_runtime_configuration()
 
 
+def test_production_runtime_configuration_accepts_tunnelpilot_environment_alias(monkeypatch) -> None:
+    from server.gateway_agent import app as gateway_app
+
+    monkeypatch.delenv("TUNNELPILOT_ENV", raising=False)
+    monkeypatch.setenv("TUNNELPILOT_ENVIRONMENT", "production")
+
+    env_main = (
+        os.getenv("TUNNELPILOT_ENV")
+        or os.getenv("TUNNELPILOT_ENVIRONMENT")
+        or "development"
+    ).strip().lower()
+    assert env_main == "production"
+
+    monkeypatch.setattr(gateway_app, "ENVIRONMENT", env_main)
+    monkeypatch.setattr(gateway_app, "GATEWAY_AGENT_TOKEN", None)
+    with pytest.raises(RuntimeError, match="TUNNELPILOT_GATEWAY_AGENT_TOKEN"):
+        gateway_app._validate_gateway_configuration()
+
+
 def test_reconcile_end_to_end_with_gateway_agent_app(monkeypatch) -> None:
     import subprocess
     from server.gateway_agent import app as gw_app
@@ -1622,3 +1644,152 @@ def test_premium_server_tier_enforcement_and_device_tier_upgrade() -> None:
     assert mig_ok.status_code == 200
     assert mig_ok.json()["server"]["id"] == "ch-zurich-premium"
     assert mig_ok.json()["tier"] == "premium"
+
+
+def test_registration_rate_limiting_enforces_429(monkeypatch) -> None:
+    main._REGISTRATION_REQUEST_HISTORY.clear()
+    monkeypatch.setattr(main, "REGISTRATION_RATE_LIMIT_MAX", 2)
+
+    # First 2 registrations succeed
+    r1 = client.post(
+        "/v1/devices",
+        json={"device_id": "rate-limit-dev-1", "client_public_key": VALID_PUBLIC_KEY, "app_version": "0.2.0"},
+    )
+    assert r1.status_code == 200
+
+    r2 = client.post(
+        "/v1/devices",
+        json={"device_id": "rate-limit-dev-2", "client_public_key": ANOTHER_PUBLIC_KEY, "app_version": "0.2.0"},
+    )
+    assert r2.status_code == 200
+
+    # 3rd registration from same IP is rate limited with 429
+    r3 = client.post(
+        "/v1/devices",
+        json={"device_id": "rate-limit-dev-3", "client_public_key": base64.b64encode(bytes(range(64, 96))).decode(), "app_version": "0.2.0"},
+    )
+    assert r3.status_code == 429
+    assert "Too many device registration attempts" in r3.json()["detail"]
+
+
+def test_select_server_picks_highest_capacity_available_server(monkeypatch) -> None:
+    main.CONTROL_PLANE_TOKEN = "admin-secret-token"
+    headers = {"Authorization": "Bearer admin-secret-token"}
+
+    # Add two servers
+    s1 = client.post(
+        "/v1/servers",
+        headers=headers,
+        json={
+            "id": "srv-capacity-small",
+            "region": "eu-central",
+            "hostname": "srv-small.example.com",
+            "public_key": VALID_PUBLIC_KEY,
+            "port": 51821,
+            "peer_capacity": 5,
+        },
+    )
+    assert s1.status_code == 201
+
+    s2 = client.post(
+        "/v1/servers",
+        headers=headers,
+        json={
+            "id": "srv-capacity-large",
+            "region": "eu-central",
+            "hostname": "srv-large.example.com",
+            "public_key": ANOTHER_PUBLIC_KEY,
+            "port": 51822,
+            "peer_capacity": 200,
+        },
+    )
+    assert s2.status_code == 201
+
+    # Disable default dev-1 to only select between s1 and s2
+    client.put("/v1/servers/dev-1", headers=headers, json={"enabled": False})
+
+    selected = main._select_server(device_tier="free")
+    assert selected.id == "srv-capacity-large"
+
+
+def test_registration_pool_exhaustion_returns_503(monkeypatch) -> None:
+    main.ALLOW_OPEN_REGISTRATION = True
+    main.CONTROL_PLANE_TOKEN = "admin-secret-token"
+    headers = {"Authorization": "Bearer admin-secret-token"}
+
+    # Add a server with capacity of exactly 1 device
+    key1 = base64.b64encode(bytes([1] * 32)).decode()
+    srv_resp = client.post(
+        "/v1/servers",
+        headers=headers,
+        json={
+            "id": "srv-cap-one",
+            "region": "eu-test",
+            "hostname": "srv-one.example.com",
+            "public_key": key1,
+            "port": 51820,
+            "peer_capacity": 1,
+            "vpn_address_pool": "10.99.0.0/30",  # .1 gateway, .2 single client
+            "vpn_gateway_address": "10.99.0.1",
+        },
+    )
+    assert srv_resp.status_code == 201
+
+    # First registration takes the single available IP
+    reg1 = client.post(
+        "/v1/devices",
+        json={"device_id": "exhaust-dev-1", "client_public_key": base64.b64encode(bytes([2] * 32)).decode(), "server_id": "srv-cap-one", "app_version": "0.2.0"},
+    )
+    assert reg1.status_code == 200
+
+    # Second registration fails with 503 (capacity reached)
+    reg2 = client.post(
+        "/v1/devices",
+        json={"device_id": "exhaust-dev-2", "client_public_key": base64.b64encode(bytes([3] * 32)).decode(), "server_id": "srv-cap-one", "app_version": "0.2.0"},
+    )
+    assert reg2.status_code == 503
+    assert "peer capacity" in reg2.json()["detail"].lower() or "fully allocated" in reg2.json()["detail"].lower()
+
+
+def test_gateway_health_probe_caching(monkeypatch) -> None:
+    main._GATEWAY_HEALTH_CACHE.clear()
+    calls = []
+
+    class DummyClient:
+        def __init__(self, *args, **kwargs):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def get(self, path):
+            calls.append(path)
+            class Resp:
+                status_code = 200
+                def json(self):
+                    return {"status": "ok", "wireguard_available": True, "peer_count": 5, "peer_capacity": 100, "capacity_remaining": 95}
+            return Resp()
+
+    monkeypatch.setattr(main.httpx, "Client", DummyClient)
+    srv = main.Server(
+        id="cache-probe-srv",
+        region="eu",
+        hostname="gw.example.com",
+        public_key=VALID_PUBLIC_KEY,
+        gateway_api_url="https://gw.example.com:8787",
+        gateway_agent_token="test-tok",
+    )
+
+    # First call triggers probe
+    res1 = main._probe_gateway(srv)
+    assert len(calls) == 1
+    assert res1["status"] == "ok"
+
+    # Second call uses cache within TTL, no new HTTP request
+    res2 = main._probe_gateway(srv)
+    assert len(calls) == 1
+    assert res2["status"] == "ok"
+
+    # Force refresh triggers probe
+    res3 = main._probe_gateway(srv, force_refresh=True)
+    assert len(calls) == 2

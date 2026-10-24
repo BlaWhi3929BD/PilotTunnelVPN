@@ -63,6 +63,7 @@ if [[ ! -f "$CONFIG_DIR/control-plane.env" ]]; then
   ADMIN_TOKEN="$(openssl rand -hex 32)"
   GATEWAY_TOKEN="$(grep -E '^TUNNELPILOT_GATEWAY_AGENT_TOKEN=' "$CONFIG_DIR/gateway.env" | cut -d= -f2)"
   cat > "$CONFIG_DIR/control-plane.env" <<EOF
+TUNNELPILOT_ENV=production
 TUNNELPILOT_ENVIRONMENT=production
 TUNNELPILOT_CONTROL_PLANE_TOKEN=${ADMIN_TOKEN}
 TUNNELPILOT_GATEWAY_AGENT_URL=http://127.0.0.1:8787

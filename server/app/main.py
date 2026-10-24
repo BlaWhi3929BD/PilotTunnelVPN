@@ -8,6 +8,7 @@ import ipaddress
 import os
 import secrets
 import sqlite3
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -27,7 +28,11 @@ RECONCILE_ON_STARTUP = os.getenv("TUNNELPILOT_RECONCILE_ON_STARTUP", "true").low
     "yes",
     "on",
 }
-ENVIRONMENT = os.getenv("TUNNELPILOT_ENV", "development").strip().lower()
+ENVIRONMENT = (
+    os.getenv("TUNNELPILOT_ENV")
+    or os.getenv("TUNNELPILOT_ENVIRONMENT")
+    or "development"
+).strip().lower()
 ALLOW_OPEN_REGISTRATION = os.getenv("TUNNELPILOT_ALLOW_OPEN_REGISTRATION", "false").lower() in {
     "1",
     "true",
@@ -80,6 +85,12 @@ _DEFAULT_DATABASE_PATH = str(
     Path(__file__).resolve().parents[2] / "server" / "data" / "tunnelpilot.db"
 )
 DATABASE_PATH = os.getenv("TUNNELPILOT_DATABASE_PATH", _DEFAULT_DATABASE_PATH)
+GATEWAY_HEALTH_CACHE_TTL = float(os.getenv("TUNNELPILOT_GATEWAY_HEALTH_CACHE_TTL", "3.0"))
+_GATEWAY_HEALTH_CACHE: dict[str, tuple[float, dict[str, int | str | bool]]] = {}
+
+REGISTRATION_RATE_LIMIT_WINDOW = float(os.getenv("TUNNELPILOT_REGISTRATION_RATE_LIMIT_WINDOW", "60.0"))
+REGISTRATION_RATE_LIMIT_MAX = int(os.getenv("TUNNELPILOT_REGISTRATION_RATE_LIMIT_MAX", "15"))
+_REGISTRATION_REQUEST_HISTORY: dict[str, list[float]] = {}
 
 
 class Server(BaseModel):
@@ -584,51 +595,66 @@ def _gateway_request(
         raise HTTPException(status_code=502, detail="Gateway agent is unreachable") from exc
 
 
-def _probe_gateway(server: Server) -> dict[str, int | str | bool]:
+def _probe_gateway(server: Server, *, force_refresh: bool = False) -> dict[str, int | str | bool]:
+    if not force_refresh:
+        cached = _GATEWAY_HEALTH_CACHE.get(server.id)
+        if cached is not None:
+            cached_at, cached_result = cached
+            if time.monotonic() - cached_at < GATEWAY_HEALTH_CACHE_TTL:
+                return cached_result
+
     base_url = _gateway_url(server)
     allocated_in_db = DEVICE_STORE.count_devices_for_server(server.id)
     configured_cap = server.configured_peer_capacity
     if not base_url:
         remaining_db = max(0, configured_cap - allocated_in_db)
-        return {
+        res: dict[str, int | str | bool] = {
             "status": "unconfigured",
             "wireguard_available": False,
             "peer_count": allocated_in_db,
             "peer_capacity": configured_cap,
             "capacity_remaining": remaining_db,
         }
+        _GATEWAY_HEALTH_CACHE[server.id] = (time.monotonic(), res)
+        return res
 
     try:
         with httpx.Client(base_url=base_url.rstrip("/"), timeout=GATEWAY_HEALTH_TIMEOUT) as client:
             response = client.get("/healthz")
     except httpx.HTTPError:
-        return {
+        res = {
             "status": "unreachable",
             "wireguard_available": False,
             "peer_count": allocated_in_db,
             "peer_capacity": configured_cap,
             "capacity_remaining": 0,
         }
+        _GATEWAY_HEALTH_CACHE[server.id] = (time.monotonic(), res)
+        return res
 
     if response.status_code >= 300:
-        return {
+        res = {
             "status": "degraded",
             "wireguard_available": False,
             "peer_count": allocated_in_db,
             "peer_capacity": configured_cap,
             "capacity_remaining": 0,
         }
+        _GATEWAY_HEALTH_CACHE[server.id] = (time.monotonic(), res)
+        return res
 
     try:
         payload = response.json()
     except ValueError:
-        return {
+        res = {
             "status": "degraded",
             "wireguard_available": False,
             "peer_count": allocated_in_db,
             "peer_capacity": configured_cap,
             "capacity_remaining": 0,
         }
+        _GATEWAY_HEALTH_CACHE[server.id] = (time.monotonic(), res)
+        return res
 
     gw_peer_count = int(payload.get("peer_count", 0))
     gw_peer_capacity = int(payload.get("peer_capacity", configured_cap))
@@ -642,17 +668,19 @@ def _probe_gateway(server: Server) -> dict[str, int | str | bool]:
     elif remaining == 0 and health_status == "ok":
         health_status = "full"
 
-    return {
+    res = {
         "status": health_status,
         "wireguard_available": wireguard_available,
         "peer_count": effective_count,
         "peer_capacity": effective_capacity,
         "capacity_remaining": remaining,
     }
+    _GATEWAY_HEALTH_CACHE[server.id] = (time.monotonic(), res)
+    return res
 
 
-def _server_with_health(server: Server) -> Server:
-    health = _probe_gateway(server)
+def _server_with_health(server: Server, *, force_refresh: bool = False) -> Server:
+    health = _probe_gateway(server, force_refresh=force_refresh)
     return server.model_copy(
         update={
             "health_status": health["status"],
@@ -1071,10 +1099,11 @@ def update_server_endpoint(
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=msg) from exc
 
     updated_srv = _server_from_row(row)
+    _GATEWAY_HEALTH_CACHE.pop(server_id, None)
     for idx, mem_srv in enumerate(SERVERS):
         if mem_srv.id == server_id:
             SERVERS[idx] = updated_srv
-    return _server_with_health(updated_srv)
+    return _server_with_health(updated_srv, force_refresh=True)
 
 
 @app.delete("/v1/servers/{server_id}", response_model=ServerDeleteResponse)
@@ -1092,6 +1121,7 @@ def delete_server_endpoint(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Server not found") from exc
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    _GATEWAY_HEALTH_CACHE.pop(server_id, None)
     SERVERS[:] = [s for s in SERVERS if s.id != server_id]
     return ServerDeleteResponse(status="deleted", server_id=server_id)
 
@@ -1225,6 +1255,20 @@ def reconcile_single_server(
     )
 
 
+def _check_registration_rate_limit(request: Request) -> None:
+    client_ip = request.client.host if request.client and request.client.host else "unknown"
+    now = time.monotonic()
+    cutoff = now - REGISTRATION_RATE_LIMIT_WINDOW
+    history = [ts for ts in _REGISTRATION_REQUEST_HISTORY.get(client_ip, []) if ts > cutoff]
+    if len(history) >= REGISTRATION_RATE_LIMIT_MAX:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="Too many device registration attempts from this IP address; please wait before registering again",
+        )
+    history.append(now)
+    _REGISTRATION_REQUEST_HISTORY[client_ip] = history
+
+
 @app.post("/v1/devices", response_model=DeviceRegistrationResponse)
 def register_device(
     request: Request,
@@ -1259,6 +1303,7 @@ def register_device(
         client_address = existing.client_address
         created_at = existing.created_at
     else:
+        _check_registration_rate_limit(request)
         same_key = DEVICE_STORE.find_by_public_key(registration.client_public_key)
         if same_key is not None:
             raise HTTPException(
@@ -1287,6 +1332,8 @@ def register_device(
                 tier="free",
             )
         except ValueError as exc:
+            if "Address pool exhausted" in str(exc):
+                raise HTTPException(status_code=503, detail="Server address pool is fully allocated") from exc
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
