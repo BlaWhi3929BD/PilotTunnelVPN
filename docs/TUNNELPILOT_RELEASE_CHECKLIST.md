@@ -44,8 +44,8 @@ Statuses: `TODO`, `IN_PROGRESS`, `PASS`, `BLOCKED`, `NOT_APPLICABLE`.
 - [x] `PASS` — Production deployment automation (systemd units for Gateway Agent with `AmbientCapabilities=CAP_NET_ADMIN`, Control Plane, automated SQLite daily backup timer, and `infra/deploy-production.sh`).
 
 ## Phase 5 — final verification
-- [x] `PASS` — `.venv/bin/pytest server/tests -q` (`48 passed in 2.25s`).
-- [x] `PASS` — `./gradlew :app:testDebugUnitTest` (`BUILD SUCCESSFUL`, 24 unit tests).
+- [x] `PASS` — `.venv/bin/pytest server/tests -q` (`53 passed in 0.69s`).
+- [x] `PASS` — `./gradlew :app:testDebugUnitTest` (`BUILD SUCCESSFUL`, 35 unit tests).
 - [x] `PASS` — `./gradlew :app:assembleDebug` (`BUILD SUCCESSFUL`, `app/build/outputs/apk/debug/app-debug.apk`).
 - [x] `PASS` — `./gradlew :app:lintDebug` (`BUILD SUCCESSFUL`, 0 errors).
 - [x] `PASS` — `./gradlew :app:assembleRelease` (`BUILD SUCCESSFUL`, R8 minification & resource shrinking enabled, `app/build/outputs/apk/release/app-release-unsigned.apk`).
@@ -58,12 +58,12 @@ Statuses: `TODO`, `IN_PROGRESS`, `PASS`, `BLOCKED`, `NOT_APPLICABLE`.
 ## Phase 6 — artifact/signing handoff
 - [x] `PASS` — Release APK path recorded and artifact verified:
   - Path: `app/build/outputs/apk/release/app-release-unsigned.apk`
-  - Size: `15,134,808` bytes
-  - SHA-256: `09da7e182b078278c91d138dbc435bccc5b41f29712a153dd477882e7380b637`
+  - Size: `15,165,748` bytes
+  - SHA-256: `5f20d053d3c0e7569f7e3fcfafbd88f5fbdea62355e3eda8f6afebcd192c4ad8`
 - [x] `PASS` — AAB path recorded and artifact verified:
   - Path: `app/build/outputs/bundle/release/app-release.aab`
-  - Size: `15,089,451` bytes
-  - SHA-256: `4c5a56e6ff86c5ad8d584d0d3f85718e08f4853fe40e227cd9b21ae4df1a549f`
+  - Size: `15,168,051` bytes
+  - SHA-256: `58f1f4d07f1ece51ff90d6c46d997a29984a941d3128468e756fe370eda1592d`
 - [x] `PASS` — Release signing configuration & guide provided (`keystore.properties.example`, `docs/RELEASE_SIGNING_GUIDE.md`, optional signing in `app/build.gradle.kts`; real private keystore preserved outside git).
 - [x] `PASS` — Production/Play requirements reviewed against official current docs (`minSdk = 26`, `targetSdk = 35`, `versionCode = 2`, `versionName = "0.2.0"`, `android.permission.BIND_VPN_SERVICE` on `GoBackend$VpnService`, `allowBackup = false`, no ad/tracking SDKs included in VPN data path).
 - [x] `PASS` — Google Play compliance package complete (`docs/PRIVACY_POLICY.md` Zero-Log declaration, `docs/PLAY_STORE_SUBMISSION_GUIDE.md` VpnService and Data Safety form responses).
@@ -79,3 +79,5 @@ Statuses: `TODO`, `IN_PROGRESS`, `PASS`, `BLOCKED`, `NOT_APPLICABLE`.
 | 2026-10-24 | `67c635a` | M2.4b Multi-server catalog, pinning, migration & Android server selector | `.venv/bin/pytest server/tests -q` -> `48 passed in 0.93s`; `./gradlew :app:testDebugUnitTest :app:assembleDebug :app:lintDebug` -> `BUILD SUCCESSFUL`. |
 | 2026-10-24 | `5cc8037` | M4 In-app monetization, systemd deployment & Play Store readiness | `.venv/bin/pytest server/tests -q` -> `48 passed in 2.25s`; `./gradlew :app:testDebugUnitTest :app:assembleRelease :app:bundleRelease :app:lintDebug` -> `BUILD SUCCESSFUL`. |
 | 2026-10-24 | `3b037a6` | Update README roadmap with completed M2.4b & M4 milestones | Reconciled README release scope with delivered code, tests, and documentation. |
+| 2026-10-24 | `bc53962` | M5 Adversarial security fixes (env drift, open registration rate limit, probe cache, /tmp token removal) | `.venv/bin/pytest server/tests -q` -> `53 passed in 0.69s`. |
+| 2026-10-24 | `ffaa296` | M2 & M4 Android enhancements (Secondary DNS, WireGuardConfigFactory unit tests, auto lifecycle premium expiry) | `./gradlew :app:testDebugUnitTest` -> `35 passed in 3s`; `./gradlew :app:assembleRelease :app:bundleRelease :app:lintDebug` -> `BUILD SUCCESSFUL`. |
