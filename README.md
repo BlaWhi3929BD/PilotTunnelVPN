@@ -29,21 +29,21 @@ TunnelPilot is an Android-first free WireGuard VPN client. The product goal is a
 
 ## Roadmap & Release Scope
 
-### Included in v0.2.0 Release Build
+### Included in Current Release (v0.2.0)
 - [x] M1 — Native Android WireGuard client, Keystore storage, All-Apps & Selected-Apps routing
 - [x] M2.1 / M2.2 — Linux WireGuard Gateway Agent with automated forwarding, TCP MSS clamping, health & capacity reporting
 - [x] M2.3a — Persistent SQLite state, SHA-256 device authentication tokens, backup/restore & `0600` permissions
 - [x] M2.3b — Authenticated client key rotation with timeout recovery and without exposing private keys
 - [x] M2.3c / M2.3d / M2.3e — Admin & self-service revocation, non-destructive gateway reconciliation, and Android identity recovery
-- [x] M2.4a — Single-node gateway catalog & capacity diagnostics (`GET /v1/servers`)
-- [x] M3 (Core) — First-run onboarding guidance, connection/permission/handshake diagnostics, state restoration (`rememberSaveable`), and network-change handling
-- [x] M5 (Engineering pre-release) — Security hardening, strict admin/enrollment auth separation, debug-only ADB CLI isolation, and verified Release APK/AAB build pipeline
+- [x] M2.4a / M2.4b — Multi-server dynamic SQLite catalog, server pinning, migration API with rollback, tombstone reconciliation, and Android region/server selector
+- [x] M3 (Core & M3.5) — First-run onboarding guidance, connection/permission/handshake diagnostics, network-change handling, and Selected Apps category presets (Browsers, Messengers, Media)
+- [x] M4 — In-app monetization: GDPR/Play Privacy & Ad choices dialog, isolated Compose AdContainer (zero access to VPN traffic), rewarded 24h Premium unlock with automatic expiry
+- [x] M5 (Production & Release Readiness) — Hardened systemd services (with `CAP_NET_ADMIN`), automated daily SQLite backup timer, `infra/deploy-production.sh`, Google Play compliance package (`docs/PRIVACY_POLICY.md`, `docs/PLAY_STORE_SUBMISSION_GUIDE.md`, `docs/RELEASE_SIGNING_GUIDE.md`), and verified Release APK & AAB build pipeline
 
-### Deferred to Post-v0.2.0 Milestones
-- [ ] M2.4b — Multi-node dynamic server registry in SQLite, region selector, and automatic failover
-- [ ] M3.5 — Optional Smart Apps / category presets (using only platform-supported VPN configuration semantics)
-- [ ] M4 — In-app monetization (consent flow, banner/rewarded ads isolated from VPN traffic, optional paid tier)
-- [ ] M5 (Public Play Store Rollout) — Production release signing keystore provisioning, public TLS deployment, Play Console `VpnService` declaration, privacy policy hosting, and closed beta track submission
+### Next Steps for Repository Owner (Public Play Store Rollout)
+- [ ] Provide private release keystore via `keystore.properties` (see `docs/RELEASE_SIGNING_GUIDE.md`) to build signed AAB
+- [ ] Host `docs/PRIVACY_POLICY.md` on public HTTPS URL
+- [ ] Submit `app-release.aab` to Google Play Console Internal/Closed Testing track (see `docs/PLAY_STORE_SUBMISSION_GUIDE.md`)
 
 ## Security rules
 
