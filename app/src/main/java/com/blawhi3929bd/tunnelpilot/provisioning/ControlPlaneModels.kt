@@ -11,6 +11,7 @@ data class RegisteredServer(
     val peerCapacity: Int? = null,
     val capacityRemaining: Int? = null,
     val tier: String = "free",
+    val latencyMs: Long? = null,
 )
 
 data class RotationResult(

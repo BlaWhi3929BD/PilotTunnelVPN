@@ -32,12 +32,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val serversError: StateFlow<String?> = controller.serversError
     val vpnPermissionRequired: StateFlow<Boolean> = controller.vpnPermissionRequired
     val hasDeviceToken: StateFlow<Boolean> = controller.hasDeviceToken
+    val autoConnectOnBoot: StateFlow<Boolean> = controller.autoConnectOnBoot
 
     fun requiredVpnPermissionIntent(): Intent? = controller.requiredVpnPermissionIntent()
 
     fun refreshState() = controller.refreshState()
 
     fun refreshInstalledApps() = controller.refreshInstalledApps()
+
+    fun setAutoConnectOnBoot(enabled: Boolean) = controller.setAutoConnectOnBoot(enabled)
 
     fun setRoutingMode(mode: RoutingMode) = controller.setRoutingMode(mode)
 

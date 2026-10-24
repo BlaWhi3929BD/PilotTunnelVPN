@@ -18,6 +18,12 @@ import com.blawhi3929bd.tunnelpilot.provisioning.ProvisioningState
 import com.blawhi3929bd.tunnelpilot.provisioning.RegisteredServer
 import com.blawhi3929bd.tunnelpilot.provisioning.SecureIdentityStore
 import com.blawhi3929bd.tunnelpilot.provisioning.WireGuardConfigFactory
+import com.blawhi3929bd.tunnelpilot.service.AndroidNetworkRoamingMonitor
+import com.blawhi3929bd.tunnelpilot.service.AndroidVpnNotificationManager
+import com.blawhi3929bd.tunnelpilot.service.NetworkRoamingMonitor
+import com.blawhi3929bd.tunnelpilot.service.NoOpNetworkRoamingMonitor
+import com.blawhi3929bd.tunnelpilot.service.NoOpVpnNotificationManager
+import com.blawhi3929bd.tunnelpilot.service.VpnNotificationProvider
 import com.wireguard.android.backend.BackendException
 import com.wireguard.android.backend.Tunnel
 import com.wireguard.config.Config
@@ -57,6 +63,7 @@ data class ControllerStatusSnapshot(
     val adsConsent: Boolean = false,
     val adsConsentAnswered: Boolean = false,
     val premiumExpiresAt: Long = 0L,
+    val autoConnectOnBoot: Boolean = false,
 )
 
 class TunnelPilotController internal constructor(
@@ -69,6 +76,9 @@ class TunnelPilotController internal constructor(
         ControlPlaneClient(it, allowCleartext = BuildConfig.DEBUG)
     },
     private val vpnPermissionChecker: () -> Intent? = { null },
+    private val notificationProvider: VpnNotificationProvider = NoOpVpnNotificationManager(),
+    private val networkMonitor: NetworkRoamingMonitor = NoOpNetworkRoamingMonitor(),
+    private val latencyMeasurer: (String, Int) -> Long? = { host, port -> defaultMeasureLatency(host, port) },
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
     startBackgroundTasks: Boolean = true,
 ) {
@@ -80,6 +90,8 @@ class TunnelPilotController internal constructor(
         installedAppsRepository = InstalledAppsRepository(context.applicationContext),
         controlPlaneClientFactory = { ControlPlaneClient(it, allowCleartext = BuildConfig.DEBUG) },
         vpnPermissionChecker = { VpnService.prepare(context.applicationContext) },
+        notificationProvider = AndroidVpnNotificationManager(context.applicationContext),
+        networkMonitor = AndroidNetworkRoamingMonitor(context.applicationContext),
     )
 
     private val operationMutex = Mutex()
@@ -148,12 +160,24 @@ class TunnelPilotController internal constructor(
     private val _hasDeviceToken = MutableStateFlow(identityStore.loadDeviceToken() != null)
     val hasDeviceToken: StateFlow<Boolean> = _hasDeviceToken.asStateFlow()
 
+    private val _autoConnectOnBoot = MutableStateFlow(settingsStore.getAutoConnectOnBoot())
+    val autoConnectOnBoot: StateFlow<Boolean> = _autoConnectOnBoot.asStateFlow()
+
     private var statsJob: Job? = null
 
     init {
         checkPremiumExpiry()
         if (startBackgroundTasks) {
             refreshInstalledApps()
+            networkMonitor.start {
+                scope.launch {
+                    if (_state.value is VpnState.Connected) {
+                        reconnectNow()
+                    } else {
+                        refreshState()
+                    }
+                }
+            }
             scope.launch {
                 if (manager.currentState() == Tunnel.State.UP) {
                     updateStats()
@@ -216,6 +240,12 @@ class TunnelPilotController internal constructor(
         _routingMode.value = mode
         settingsStore.setRoutingMode(mode)
         markRoutingChanged()
+    }
+
+    fun setAutoConnectOnBoot(enabled: Boolean) {
+        if (_autoConnectOnBoot.value == enabled) return
+        _autoConnectOnBoot.value = enabled
+        settingsStore.setAutoConnectOnBoot(enabled)
     }
 
     fun toggleApp(packageName: String) {
@@ -311,10 +341,14 @@ class TunnelPilotController internal constructor(
                 val baseUrl = _controlPlaneUrl.value.trim()
                 require(baseUrl.isNotBlank()) { "Control plane URL is required" }
                 val fetched = controlPlaneClientFactory(baseUrl).listServers()
-                _servers.value = fetched
+                val enriched = fetched.map { srv ->
+                    val latency = latencyMeasurer(srv.hostname, srv.port)
+                    if (latency != null) srv.copy(latencyMs = latency) else srv
+                }
+                _servers.value = enriched
                 _serversLoaded.value = true
                 _serversError.value = null
-                fetched
+                enriched
             }.onFailure { error ->
                 _serversError.value = error.message ?: "Unable to fetch server list"
             }
@@ -857,6 +891,7 @@ class TunnelPilotController internal constructor(
             adsConsent = _adsConsent.value,
             adsConsentAnswered = _adsConsentAnswered.value,
             premiumExpiresAt = _premiumExpiresAt.value,
+            autoConnectOnBoot = _autoConnectOnBoot.value,
         )
     }
 
@@ -868,6 +903,7 @@ class TunnelPilotController internal constructor(
             waitForBackendState(Tunnel.State.DOWN)
             _state.value = VpnState.Disconnected
             _reconnectRequired.value = false
+            notificationProvider.dismissNotification()
         }.onFailure {
             setError(it.message ?: "Unable to disconnect")
         }
@@ -898,6 +934,7 @@ class TunnelPilotController internal constructor(
         }
 
         _state.value = VpnState.Connecting
+        notificationProvider.showConnectingNotification()
         return try {
             val installedList = installedAppsRepository.getLaunchableApps()
             _installedApps.value = installedList
@@ -950,6 +987,7 @@ class TunnelPilotController internal constructor(
             statsJob = null
             _state.value = VpnState.Disconnected
             _reconnectRequired.value = false
+            notificationProvider.dismissNotification()
         }
     }
 
@@ -957,9 +995,16 @@ class TunnelPilotController internal constructor(
         if (manager.currentState() != Tunnel.State.UP) return
         val stats = manager.statistics()
         val prev = _state.value as? VpnState.Connected
+        val rx = stats?.totalRx() ?: prev?.rxBytes ?: 0L
+        val tx = stats?.totalTx() ?: prev?.txBytes ?: 0L
         _state.value = VpnState.Connected(
-            rxBytes = stats?.totalRx() ?: prev?.rxBytes ?: 0L,
-            txBytes = stats?.totalTx() ?: prev?.txBytes ?: 0L,
+            rxBytes = rx,
+            txBytes = tx,
+        )
+        notificationProvider.showConnectedNotification(
+            settingsStore.getAssignedServerId(),
+            rx,
+            tx,
         )
     }
 
@@ -971,12 +1016,27 @@ class TunnelPilotController internal constructor(
         statsJob?.cancel()
         statsJob = null
         _state.value = VpnState.Error(message)
+        notificationProvider.dismissNotification()
     }
 
     private data class Tuple4<A, B, C, D>(val first: A, val second: B, val third: C, val fourth: D)
 
     companion object {
         private val PACKAGE_NAME_REGEX = Regex("^[a-zA-Z][a-zA-Z0-9_]*(\\.[a-zA-Z][a-zA-Z0-9_]*)+$")
+
+        fun defaultMeasureLatency(hostname: String, port: Int): Long? {
+            val start = System.currentTimeMillis()
+            return try {
+                val socket = java.net.Socket()
+                socket.connect(java.net.InetSocketAddress(hostname, port), 600)
+                socket.close()
+                System.currentTimeMillis() - start
+            } catch (_: java.net.ConnectException) {
+                System.currentTimeMillis() - start
+            } catch (_: Exception) {
+                null
+            }
+        }
 
         @Volatile
         private var instance: TunnelPilotController? = null

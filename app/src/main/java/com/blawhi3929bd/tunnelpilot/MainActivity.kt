@@ -69,8 +69,21 @@ class MainActivity : ComponentActivity() {
         if (it.resultCode == RESULT_OK) viewModel.connect()
     }
 
+    private val notificationPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) {
+        viewModel.refreshState()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            if (checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) !=
+                android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                notificationPermissionLauncher.launch(android.Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
         connectivityManager = getSystemService(ConnectivityManager::class.java)
         try {
             if (checkSelfPermission(android.Manifest.permission.ACCESS_NETWORK_STATE) ==
@@ -137,6 +150,7 @@ private fun TunnelPilotScreen(
     val serversError by viewModel.serversError.collectAsState()
     val vpnPermissionRequired by viewModel.vpnPermissionRequired.collectAsState()
     val hasDeviceToken by viewModel.hasDeviceToken.collectAsState()
+    val autoConnectOnBoot by viewModel.autoConnectOnBoot.collectAsState()
 
     var showConsentDialog by remember { mutableStateOf(false) }
 
@@ -178,6 +192,8 @@ private fun TunnelPilotScreen(
                 deviceTier = deviceTier,
                 adsConsent = adsConsent,
                 premiumExpiresAt = premiumExpiresAt,
+                autoConnectOnBoot = autoConnectOnBoot,
+                onToggleAutoConnectOnBoot = viewModel::setAutoConnectOnBoot,
                 vpnPermissionRequired = vpnPermissionRequired,
                 routingMode = routingMode,
                 selectedCount = selectedApps.size,
@@ -246,6 +262,8 @@ private fun VpnSection(
     deviceTier: String,
     adsConsent: Boolean,
     premiumExpiresAt: Long = 0L,
+    autoConnectOnBoot: Boolean = false,
+    onToggleAutoConnectOnBoot: (Boolean) -> Unit = {},
     vpnPermissionRequired: Boolean,
     routingMode: RoutingMode,
     selectedCount: Int,
@@ -337,7 +355,18 @@ private fun VpnSection(
                     Spacer(Modifier.height(4.dp))
                     TextButton(onClick = onOpenApps) { Text("Select apps") }
                 }
-                Spacer(Modifier.height(16.dp))
+                Spacer(Modifier.height(12.dp))
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Checkbox(
+                        checked = autoConnectOnBoot,
+                        onCheckedChange = onToggleAutoConnectOnBoot,
+                    )
+                    Text("Connect on device reboot", style = MaterialTheme.typography.bodyMedium)
+                }
+                Spacer(Modifier.height(12.dp))
 
                 Button(
                     onClick = onConnect,
@@ -735,8 +764,9 @@ private fun SetupSection(
                         .padding(vertical = 4.dp),
                 ) {
                     Column(Modifier.padding(12.dp)) {
+                        val latencyBadge = if (server.latencyMs != null) " • ${server.latencyMs} ms" else ""
                         Text(
-                            "${server.id} [${server.region} / ${server.tier.uppercase(Locale.US)}] — ${server.healthStatus}$cap",
+                            "${server.id} [${server.region} / ${server.tier.uppercase(Locale.US)}] — ${server.healthStatus}$cap$latencyBadge",
                             style = MaterialTheme.typography.bodyMedium,
                         )
                         Text(

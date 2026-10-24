@@ -25,6 +25,8 @@ interface SettingsStorage {
     fun setHasAnsweredConsent(answered: Boolean) {}
     fun getPremiumExpiresAt(): Long = 0L
     fun setPremiumExpiresAt(timestampMs: Long) {}
+    fun getAutoConnectOnBoot(): Boolean = false
+    fun setAutoConnectOnBoot(enabled: Boolean) {}
 }
 
 class AppSettingsStore(context: Context) : SettingsStorage {
@@ -108,6 +110,12 @@ class AppSettingsStore(context: Context) : SettingsStorage {
         prefs.edit { putLong(KEY_PREMIUM_EXPIRES_AT, timestampMs.coerceAtLeast(0L)) }
     }
 
+    override fun getAutoConnectOnBoot(): Boolean = prefs.getBoolean(KEY_AUTO_CONNECT_ON_BOOT, false)
+
+    override fun setAutoConnectOnBoot(enabled: Boolean) {
+        prefs.edit { putBoolean(KEY_AUTO_CONNECT_ON_BOOT, enabled) }
+    }
+
     private companion object {
         const val NAME = "tunnelpilot_settings"
         const val KEY_ROUTING_MODE = "routing_mode"
@@ -120,6 +128,7 @@ class AppSettingsStore(context: Context) : SettingsStorage {
         const val KEY_ADS_CONSENT = "ads_consent"
         const val KEY_CONSENT_ANSWERED = "consent_answered"
         const val KEY_PREMIUM_EXPIRES_AT = "premium_expires_at"
+        const val KEY_AUTO_CONNECT_ON_BOOT = "auto_connect_on_boot"
         const val DEFAULT_CONTROL_PLANE_URL = "http://10.0.2.2:8000"
     }
 }

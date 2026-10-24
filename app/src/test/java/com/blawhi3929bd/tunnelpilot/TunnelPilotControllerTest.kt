@@ -582,6 +582,12 @@ class TunnelPilotControllerTest {
         override fun setPremiumExpiresAt(timestampMs: Long) {
             this.premiumExpiresAt = timestampMs
         }
+
+        private var autoConnectOnBoot: Boolean = false
+        override fun getAutoConnectOnBoot(): Boolean = autoConnectOnBoot
+        override fun setAutoConnectOnBoot(enabled: Boolean) {
+            this.autoConnectOnBoot = enabled
+        }
     }
 
     private class FakeIdentityStorage : IdentityStorage {
